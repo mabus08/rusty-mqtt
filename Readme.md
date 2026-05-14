@@ -4,6 +4,10 @@
 
 a small lightweight mqtt broker written with rust using tokio.
 
+## Completed
+
+- Task00: add connection handling (CONNECT parsing + CONNACK response, DISCONNECT detection, timeout handling)
+
 ## To-do:
 
 - Task01: add subscription protocol
