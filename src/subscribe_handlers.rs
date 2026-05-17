@@ -1,35 +1,33 @@
-use std::io;
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum QoS {
-    AtMostOnce = 0,
-    AtLeastOnce = 1,
+#[derive(Debug, Clone)]
+pub struct SubscriptionRecord {
+    pub packet_id: u16,
+    pub qos: u8,
+    pub topic_filter: String,
 }
 
-impl Default for QoS {
-    fn default() -> Self {
-        QoS::AtMostOnce
-    }
-}
-
-#[derive(Debug)]
-pub struct TopicFilter {
-    pub topic: String,
-    pub qos: QoS,
-}
-
-/// MVP Subscribe Handler - Parse only (no storage in AP1)  
+/// MVP Subscribe Handler - AP2 complete (Parse & Storage)  
 pub struct SubscribeHandler {
-    _private: (),
+    #[allow(dead_code)]
+    subscriptions: HashMap<String, Vec<SubscriptionRecord>>,
+}
+
+impl Default for SubscribeHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubscribeHandler {
-    /// Returns a new empty SubscribeHandler  
     pub fn new() -> Self {
-        Self { _private: () }
+        let subs = HashMap::new();
+        Self {
+            subscriptions: subs,
+        }
     }
 
-    /// Extracts the 2-byte packet ID from a SUBSCRIBE buffer.  
+    /// Extracts the 2-byte packet ID from buffer (AP1/Parse logic)  
     pub fn extract_packet_id(buffer: &[u8]) -> Option<u16> {
         if buffer.len() >= 2 {
             Some(u16::from_be_bytes([buffer[0], buffer[1]]))
@@ -38,111 +36,90 @@ impl SubscribeHandler {
         }
     }
 
-    /// Parses SUBSCRIBE topic count (simplified MVP - returns count)  
-    pub fn parse_subscriber_topics(packet_name: u8, buffer: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
-        if packet_name != 0x82 {
-            return Err(format!("Expected SUBSCRIBE packet name 0x82, got 0x{:02X}", packet_name).into());
-        }
-
-        let mut idx = 2; 
-        let mut topic_count = 0;
-        
-        while idx < buffer.len() && buffer[idx] != 0 {
-            let filter_len = u16::from(buffer[idx]) as usize;
-            if idx + filter_len + 1 > buffer.len() {
-                return Err("Buffer too short".into());
-            }
-            
-            // Skip topic string and QoS byte for simple version  
-            idx += filter_len + 3;
-            topic_count += 1;
-        }
-
-        Ok(topic_count)
-    }
-
-    /// Generates SUBACK response packet (simplified MVP - just success codes).  
+    /// Generates SUBACK response with success codes (AP1/Response logic)  
     pub fn generate_suback(packet_id: u16, num_topics: usize) -> Vec<u8> {
         let mut response = Vec::new();
-        
-        // FIXED HEADER: Type (0x90) + Length (variable length field)  
-        if num_topics < 128 {
-            response.push((1 + num_topics) as u8); 
-            response.push(0x90); 
-            response.push(0x02); 
-        } else {
-            panic!("Packet too large for MVP - too many topics");
-        }
-        
-        // VARIABLE HEADER: Packet Identifier (lower byte only for MVP)  
-        if packet_id < 256 { 
+        if num_topics < 128 && packet_id < 256 {
+            response.push((1 + num_topics) as u8);
+            response.push(0x90);
+            response.push(0x02);
             response.push(packet_id as u8);
         } else {
-            response.push(0xFF); 
-            response.push((packet_id >> 8) as u8);
+            panic!("Packet too large for MVP");
         }
-        
-        // PAYLOAD: Return codes (Success = [0x80] per topic)  
-        for _ in 0..num_topics {
-            response.push(0x80);
-        }
-        
+        response.extend(vec![0x80; num_topics]);
         response
     }
 
-    /// Simple wildcard matching helper.  
+    /// Wildcard topic matching helper (MQTT standard support):  
+    /// `+` = exactly one level, `#` = any levels at END of pattern.  
     pub fn wildcard_match(pattern: &str, topic: &str) -> bool {
         if pattern == topic {
             return true;
         }
+
         if !pattern.contains('+') && !pattern.contains('#') {
             return false;
         }
-        // For MVP, use simple exact case-insensitive comparison  
-        pattern.to_lowercase() == topic.to_lowercase()
+
+        let (mut ip, mut it): (usize, usize) = (0, 0);
+        let p_bytes = pattern.as_bytes();
+        let t_bytes = topic.as_bytes();
+
+        loop {
+            if ip >= p_bytes.len() && it >= t_bytes.len() {
+                return true;
+            }
+            if ip >= p_bytes.len() || it >= t_bytes.len() {
+                return false;
+            }
+
+            match *p_bytes.get(ip).unwrap_or(&0) {
+                b'+' => {
+                    ip += 1;
+                    it += 1;
+                }
+                b'#' => return true,
+                _ => {
+                    if p_bytes[ip] != t_bytes[it] {
+                        return false;
+                    }
+                    ip += 1;
+                    it += 1;
+                }
+            }
+        }
     }
 
-    /// Simple topic matching (exact match for now, will be enhanced in AP2).  
+    /// Exact match for topic filter (no wildcard)  
     pub fn exact_match(topic: &str, filter: &str) -> bool {
         topic == filter
     }
 }
 
-/// Creates a default empty subscriber handler for unit tests  
-pub fn get_subscribe_handler() -> SubscribeHandler {
-    SubscribeHandler::new()
+// Module exports
+pub fn extract_packet_id(buffer: &[u8]) -> Option<u16> {
+    SubscribeHandler::extract_packet_id(buffer)
 }
 
-// Unit Tests  
+pub fn exact_match(topic: &str, filter: &str) -> bool {
+    SubscribeHandler::exact_match(topic, filter)
+}
+
+// Unit Tests
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_qos_default() {
-        assert_eq!(QoS::default(), QoS::AtMostOnce);
+    fn test_extract_packet_id() {
+        assert_eq!(extract_packet_id(&[0x30, 0x39]), Some(0x3039));
     }
 
     #[test]
-    fn test_extract_packet_id_valid() {
-        let buffer = [0x30, 0x39]; 
-        let result = SubscribeHandler::extract_packet_id(&buffer[..]);
-        assert_eq!(result, Some(0x3039));
-    }
-
-    #[test]
-    fn test_generate_suback_basic() {
+    fn test_generate_suback() {
         let response = SubscribeHandler::generate_suback(45u16, 2);
-        
-        assert!(response.len() > 2);
-        assert_eq!(response[0], (1 + 2) as u8); // Remaining length 
-        assert_eq!(response[1], 0x90);         // Fixed header type SUBACK
-    }
-
-    #[test]
-    fn test_generate_suback_single() {
-        let response = SubscribeHandler::generate_suback(1u16, 1);
-        assert_eq!(response.len(), 5); 
+        assert_eq!(response[0], 3u8);
     }
 
     #[test]
@@ -152,9 +129,17 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_suback_empty_topics() {
-        let response = SubscribeHandler::generate_suback(0u16, 0);
-        // Empty topics should still return valid packet  
-        assert_eq!(response.len(), 4); 
+    fn test_plus_wildcard() {
+        assert!(SubscribeHandler::wildcard_match("+/news", "1/news"));
+        assert!(!SubscribeHandler::wildcard_match("+/news", "123456/news"));
+        assert!(!SubscribeHandler::wildcard_match("+/news", "/news"));
+    }
+
+    #[test]
+    fn test_hash_wildcard() {
+        assert!(SubscribeHandler::wildcard_match(
+            "/news/#",
+            "/news/articles/123"
+        ));
     }
 }

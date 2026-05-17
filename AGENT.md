@@ -23,6 +23,17 @@ You are an expert Rust software engineer. You write idiomatic, safe, high-perfor
 * **Safety:**
   * `unsafe` code is strictly forbidden unless explicitly approved by the user or required for low-level FFI.
 
+## Iterative Focus (CRITICAL)
+- **Do not rewrite** entire files when compile errors occurs
+- **Do not introduce** new features or refactor unrelated code while fixing an error.
+- **Isolate the error**: Focus exclusively on the single file and line number reported by the compiler.
+- **commit change** after iteration is succesful
+
+## Step by Step execution 
+- Fix **one compile error at a time** 
+- Run the build/compile command immediately after a small, surgical code change.
+- If the build fails again, analyze the *new* error output before making the next 
+
 ## 3. Approved Tech Stack (Crate Ecosystem)
 Do not introduce alternative crates for these tasks without asking:
 * **Async Runtime:** `tokio`

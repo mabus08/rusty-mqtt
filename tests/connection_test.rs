@@ -1,11 +1,11 @@
-use rusty_mqtt::MqttServer; 
+use rusty_mqtt::MqttServer;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
 #[tokio::test]
 async fn test_external_connection() {
     let addr = "127.0.0.1:1885";
-    
+
     tokio::spawn(async move {
         let server = MqttServer::new(addr);
         let _ = server.run().await;
@@ -13,7 +13,9 @@ async fn test_external_connection() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("Konnte nicht verbinden");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("Konnte nicht verbinden");
     stream.write_all(&[0x10, 0x02, 0x00, 0x00]).await.unwrap();
 
     let mut response = [0u8; 4];
