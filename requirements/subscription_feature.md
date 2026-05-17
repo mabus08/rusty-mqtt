@@ -253,3 +253,19 @@ impl MqttServer {
 - `test_suback_response()` - Return code in packet correct?
 - `test_concurrent_subscribe()` - Mehrere Subscription auf einmal
 
+
+---
+
+## ✅ Arbeitspaket 2 (In Progress) - Status: Wildcard-Matching Implementiert
+
+### Current Implementation (AP2 Step 1-Complete):
+
+**Liefervorschlag:**
+- ⚙️ `src/subscribe_handlers/storage.rs` - Subscriber storage mit client_id key
+- ⚙️ `src/subscribe_handlers/wildcards.rs` - MQTT Topic wildcard matching
+  
+### Nächste Schritte nach Wildcard-Matching:
+
+- [ ] Unit-Tests für Topic-Match Logik (`test_match_plus()`, `test_match_hash()`)
+- [ ] Testfälle: `/+/news/#` → `/news/articles/123` should match  
+- [ ] Integrationstest mit Broker (AP3 integration)

@@ -3,6 +3,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 use std::error::Error;
 
+pub mod subscribe_handlers;
+
 #[derive(Debug, PartialEq)]
 pub enum MqttPacket {
     Connect,
