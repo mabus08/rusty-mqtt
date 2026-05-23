@@ -11,16 +11,14 @@ mod subscribe_integration {
 
     #[test]
     fn test_plus_wildcard_basic() {
-        // If the implementation supports + wildcards at single level positions, this should pass:
-        let result = SubscribeHandler::wildcard_match("+/news/", "/1/news/");
-        if !result {
-            eprintln!("Warning: + wildcard test failed - may need to fix wildcard matching logic");
-        }
+        // + matches exactly one topic level
+        let result = SubscribeHandler::wildcard_match("+/news", "sport/news");
+        assert!(result, "+ should match one full topic level");
     }
 
     #[test]
     fn test_suback_response_structure() {
-        let response = SubscribeHandler::generate_suback(45u16, 2);
+        let response = SubscribeHandler::generate_suback(45u16, &[0x00, 0x00]);
 
         assert!(!response.is_empty(), "SUBACK response should not be empty");
         assert_eq!(response[0], 0x90, "Byte 0 should be SUBACK packet type");
@@ -38,5 +36,40 @@ mod subscribe_integration {
     fn test_exact_match_differents() {
         let not_same = SubscribeHandler::wildcard_match("/home", "/about");
         assert!(!not_same, "Different topics should not match");
+    }
+
+    #[test]
+    fn test_suback_reflects_granted_qos() {
+        // QoS 1 subscription should be reflected in SUBACK
+        let response = SubscribeHandler::generate_suback(100u16, &[0x01]);
+        assert_eq!(response[4], 0x01, "Return code should reflect QoS 1");
+    }
+
+    #[test]
+    fn test_connect_client_id_parsing() {
+        use rusty_mqtt::MqttServer;
+
+        // Build a minimal CONNECT packet with client ID "test-client"
+        let client_id = b"test-client";
+        let mut packet: Vec<u8> = Vec::new();
+        // Fixed Header
+        packet.push(0x10); // CONNECT
+        packet.push(0x00); // Remaining length placeholder (will fix)
+        // Variable Header
+        packet.extend_from_slice(&[0x00, 0x04]); // Protocol Name Length
+        packet.extend_from_slice(b"MQTT");        // Protocol Name
+        packet.push(0x04);                        // Protocol Level (3.1.1)
+        packet.push(0x02);                        // Connect Flags (Clean Session)
+        packet.extend_from_slice(&[0x00, 0x3C]);  // Keep Alive (60s)
+        // Payload: Client ID
+        packet.push(0x00);                        // Client ID Length MSB
+        packet.push(client_id.len() as u8);       // Client ID Length LSB
+        packet.extend_from_slice(client_id);
+
+        // Fix remaining length
+        packet[1] = (packet.len() - 2) as u8;
+
+        let parsed = MqttServer::parse_connect_client_id(&packet);
+        assert_eq!(parsed, "test-client");
     }
 }

@@ -1,5 +1,5 @@
 pub mod storage;
-pub use storage::TopicRouter;
+pub use storage::{Subscriber, TopicRouter, topic_matches};
 
 #[derive(Debug, Clone)]
 pub struct SubscriptionRecord {
@@ -36,55 +36,25 @@ impl SubscribeHandler {
         }
     }
 
-    /// Generates SUBACK response per MQTT v3.1.1 spec
-    pub fn generate_suback(packet_id: u16, num_topics: usize) -> Vec<u8> {
+    /// Generates SUBACK response per MQTT v3.1.1 spec.
+    /// `granted_qos` enthaelt die tatsaechlich gewährten QoS-Werte (je 1 Byte pro Subscription).
+    pub fn generate_suback(packet_id: u16, granted_qos: &[u8]) -> Vec<u8> {
         let mut response = vec![
             0x90,
-            (2 + num_topics) as u8,
+            (2 + granted_qos.len()) as u8,
             (packet_id >> 8) as u8,
             (packet_id & 0xFF) as u8,
         ];
-        response.extend(vec![0x00; num_topics]);
+        response.extend_from_slice(granted_qos);
         response
     }
 
-    /// Topic wildcard matching with + and # support  
-    pub fn wildcard_match(pattern: &str, topic: &str) -> bool {
-        if pattern == topic {
-            return true;
-        }
-
-        let mut ip = 0;
-        let mut it = 0;
-        let p_bytes = pattern.as_bytes();
-        let t_bytes = topic.as_bytes();
-
-        loop {
-            if ip >= p_bytes.len() && it >= t_bytes.len() {
-                return true;
-            }
-            if ip >= p_bytes.len() || it >= t_bytes.len() {
-                return false;
-            }
-
-            match *p_bytes.get(ip).unwrap_or(&0) {
-                b'+' => {
-                    ip += 1;
-                    it += 1;
-                }
-                b'#' => return true,
-                _ => {
-                    if p_bytes[ip] != t_bytes[it] {
-                        return false;
-                    }
-                    ip += 1;
-                    it += 1;
-                }
-            }
-        }
+    /// Topic wildcard matching -- delegiert an die kanonische Implementierung in storage.
+    pub fn wildcard_match(filter: &str, topic: &str) -> bool {
+        topic_matches(filter, topic)
     }
 }
 
 pub fn exact_match(topic: &str, filter: &str) -> bool {
-    SubscribeHandler::wildcard_match(topic, filter)
+    topic_matches(topic, filter)
 }

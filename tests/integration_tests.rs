@@ -14,8 +14,6 @@ mod integration {
 
     #[test]
     fn test_hash_matches_anything_when_at_end() {
-        use rusty_mqtt::subscribe_handlers::SubscribeHandler;
-
         let result = SubscribeHandler::wildcard_match("/#", "/anything/here/at/all");
         assert!(
             result,
@@ -28,8 +26,6 @@ mod integration {
 
     #[test]
     fn test_hash_with_prefix() {
-        use rusty_mqtt::subscribe_handlers::SubscribeHandler;
-
         let result = SubscribeHandler::wildcard_match("/news/#", "/news/articles/b/c");
         assert!(
             result,
@@ -39,17 +35,13 @@ mod integration {
 
     #[test]
     fn test_partial_topic_path() {
-        use rusty_mqtt::subscribe_handlers::SubscribeHandler;
-
         let result = SubscribeHandler::wildcard_match("/a/+/c", "/b/c");
         assert!(!result, "Different first level fails");
     }
 
     #[test]
     fn test_suback_response_generation() {
-        use rusty_mqtt::subscribe_handlers::SubscribeHandler;
-
-        let response = SubscribeHandler::generate_suback(45u16, 2);
+        let response = SubscribeHandler::generate_suback(45u16, &[0x00, 0x01]);
         assert_eq!(
             response.len(),
             6,
@@ -58,15 +50,18 @@ mod integration {
         assert_eq!(response[0], 0x90, "Byte 0 = SUBACK packet type");
         assert_eq!(response[1], 4u8, "Remaining length = 2 + num_topics");
         assert_eq!(response[3], 45u8, "Packet ID LSB = 45");
-        assert_eq!(response[4], 0x00, "Return code 0 = success");
+        assert_eq!(response[4], 0x00, "Return code 0 = QoS 0 granted");
+        assert_eq!(response[5], 0x01, "Return code 1 = QoS 1 granted");
     }
 
     #[test]
     fn test_plus_wildcard_single_level() {
-        use rusty_mqtt::subscribe_handlers::SubscribeHandler;
+        // + matches exactly one topic level (between / separators)
+        let result = SubscribeHandler::wildcard_match("+/news", "sport/news");
+        assert!(result, "+ matches one full topic level");
 
-        let result = SubscribeHandler::wildcard_match("/+/news/", "/x/news/");
-        assert!(result, "+ at char position 1 matches different word");
+        let no_match = SubscribeHandler::wildcard_match("+/news", "a/b/news");
+        assert!(!no_match, "+ should not match multiple levels");
     }
 }
 

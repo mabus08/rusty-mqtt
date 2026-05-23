@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 pub mod subscribe_handlers;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -107,20 +108,20 @@ pub enum MqttPacket {
     Publish(String),
     Disconnect,
     PINGREQ,
-    PUBLISH,
     Unknown,
 }
 
-// Remove this field since we don't store subscribe_handler in new()
 pub struct MqttServer {
     #[allow(unused)]
     address: String,
+    topic_router: Arc<Mutex<TopicRouter>>,
 }
 
 impl MqttServer {
     pub fn new(addr: &str) -> Self {
         Self {
             address: addr.to_string(),
+            topic_router: Arc::new(Mutex::new(TopicRouter::new())),
         }
     }
 
@@ -128,6 +129,7 @@ impl MqttServer {
     pub fn from_config(config: BrokerConfig) -> Self {
         Self {
             address: config.address(),
+            topic_router: Arc::new(Mutex::new(TopicRouter::new())),
         }
     }
 
@@ -145,8 +147,9 @@ impl MqttServer {
                 }
             };
 
+            let router = Arc::clone(&self.topic_router);
             tokio::spawn(async move {
-                if let Err(e) = MqttServer::handle_connection(socket, actual_addr.port()).await {
+                if let Err(e) = MqttServer::handle_connection(socket, router).await {
                     eprintln!("Fehler in Client-Verbindung: {}", e);
                 }
             });
@@ -155,38 +158,46 @@ impl MqttServer {
 
     async fn handle_connection(
         mut socket: TcpStream,
-        port: u16,
+        router: Arc<Mutex<TopicRouter>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut buffer = [0u8; 1024];
         let timeout_duration = Duration::from_secs(300);
+        let mut client_id: Option<String> = None;
 
         loop {
             let bytes_read = match timeout(timeout_duration, socket.read(&mut buffer)).await {
-                Ok(result) => result.map_err(|e| format!("Read error on {}: {}", port, e))?,
+                Ok(result) => result.map_err(|e| format!("Read error: {}", e))?,
                 Err(_) => {
-                    println!("😒 Client Timeout");
-                    return Ok(());
+                    println!("Client Timeout");
+                    break;
                 }
             };
 
             if bytes_read == 0 {
                 println!("Client disconnected");
-                return Ok(());
+                break;
             }
 
             let packet_type = MqttServer::parse_packet(&buffer[..bytes_read]);
 
             match packet_type {
                 MqttPacket::Connect => {
+                    let parsed_client_id = MqttServer::parse_connect_client_id(&buffer[..bytes_read]);
+                    println!("Connection from client: {:?}", parsed_client_id);
+                    client_id = Some(parsed_client_id);
+
                     let connack = [0x20, 0x02, 0x00, 0x00];
                     socket.write_all(&connack).await?;
-                    println!(" ☎️ Connection successful");
                 }
                 MqttPacket::Subscribe(_packet_id) => {
-                    println!(" 👉 Subscribe received");
-                    let suback = handle_subscribe_impl(&buffer[..bytes_read]).await?;
+                    let cid = client_id.as_deref().unwrap_or("unknown");
+                    let suback = MqttServer::handle_subscribe_impl(
+                        &buffer[..bytes_read],
+                        cid,
+                        &router,
+                    )?;
                     socket.write_all(&suback).await?;
-                    println!(" ✅ SUBACK sent");
+                    println!("SUBACK sent for client: {}", cid);
                 }
                 MqttPacket::PINGREQ => {
                     let pingresp = [0xD0, 0x00];
@@ -194,7 +205,7 @@ impl MqttServer {
                 }
                 MqttPacket::Disconnect => {
                     println!("Client sent DISCONNECT");
-                    return Ok(());
+                    break;
                 }
                 MqttPacket::Publish(_topic) => {
                     // TODO: Publish handling with topic routing via TopicRouter
@@ -202,16 +213,31 @@ impl MqttServer {
                 _ => {}
             }
         }
+
+        // Client-Subscriptions aufraeumen bei Disconnect/Timeout
+        if let Some(ref cid) = client_id {
+            if let Ok(mut r) = router.lock() {
+                r.remove_client(cid);
+            }
+        }
+
+        Ok(())
     }
 
-    pub async fn handle_subscribe_impl(buffer: &[u8]) -> Result<Vec<u8>, String> {
+    /// Parst ein SUBSCRIBE-Paket, speichert Subscriptions im Router,
+    /// und gibt ein SUBACK mit den korrekten granted QoS-Werten zurueck.
+    pub fn handle_subscribe_impl(
+        buffer: &[u8],
+        client_id: &str,
+        router: &Arc<Mutex<TopicRouter>>,
+    ) -> Result<Vec<u8>, String> {
         if buffer.len() < 4 {
             return Err("Buffer too short for SUBSCRIBE".to_string());
         }
 
         let packet_id = ((buffer[2] as u16) << 8) | (buffer[3] as u16);
 
-        let mut topic_filters = Vec::new();
+        let mut topic_filters: Vec<(String, u8)> = Vec::new();
         let mut offset = 4usize;
 
         while offset + 2 < buffer.len() {
@@ -235,10 +261,50 @@ impl MqttServer {
             topic_filters.push((topic, qos));
         }
 
-        Ok(SubscribeHandler::generate_suback(
-            packet_id,
-            topic_filters.len(),
-        ))
+        // Subscriptions im Router speichern und granted QoS erhalten
+        let granted_qos = router
+            .lock()
+            .map_err(|e| format!("Router lock failed: {}", e))?
+            .subscribe(client_id, &topic_filters);
+
+        Ok(SubscribeHandler::generate_suback(packet_id, &granted_qos))
+    }
+
+    /// Extrahiert die Client ID aus einem CONNECT-Paket (MQTT 3.1.1).
+    ///
+    /// CONNECT Layout:
+    ///   Byte 0:    Fixed Header (0x10)
+    ///   Byte 1:    Remaining Length
+    ///   Byte 2-8:  Variable Header (Protocol Name "MQTT" + Protocol Level + Connect Flags + Keep Alive)
+    ///   Payload:   Client ID (UTF-8 length-prefixed String)
+    pub fn parse_connect_client_id(buffer: &[u8]) -> String {
+        // Minimum: Fixed Header (2) + Variable Header (10) + Client ID Length (2) = 14
+        if buffer.len() < 14 {
+            return "unknown".to_string();
+        }
+
+        // Remaining Length (simplified: single-byte encoding, ausreichend fuer MVP)
+        let remaining_start = 2usize;
+
+        // Variable Header: 7 bytes Protocol Name ("MQTT") + Level + Flags + Keep Alive
+        // Protocol Name Length (2 bytes) + "MQTT" (4 bytes) + Protocol Level (1) + Connect Flags (1) + Keep Alive (2) = 10 bytes
+        let client_id_offset = remaining_start + 10;
+
+        if buffer.len() < client_id_offset + 2 {
+            return "unknown".to_string();
+        }
+
+        let client_id_len =
+            ((buffer[client_id_offset] as usize) << 8) | (buffer[client_id_offset + 1] as usize);
+
+        let client_id_start = client_id_offset + 2;
+
+        if buffer.len() < client_id_start + client_id_len {
+            return "unknown".to_string();
+        }
+
+        String::from_utf8_lossy(&buffer[client_id_start..client_id_start + client_id_len])
+            .to_string()
     }
 
     pub fn parse_packet(buffer: &[u8]) -> MqttPacket {
@@ -270,22 +336,15 @@ impl MqttServer {
             let byte2 = buffer[offset + 1];
             Ok((byte1 as u16) << 8 | byte2 as u16)
         } else {
-            Err("Buffer zu kurz für Packet ID".into())
+            Err("Buffer zu kurz fuer Packet ID".into())
         }
     }
-}
 
-// Module exports for external use (when needed)
-pub async fn handle_subscribe_impl(buffer: &[u8]) -> Result<Vec<u8>, String> {
-    MqttServer::handle_subscribe_impl(buffer).await
+    pub fn get_address(&self) -> &str {
+        &self.address
+    }
 }
 
 pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
     MqttServer::extract_packet_id(buffer, offset)
-}
-
-impl MqttServer {
-    pub fn get_address(&self) -> &str {
-        &self.address
-    }
 }
