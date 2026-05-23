@@ -54,3 +54,8 @@ Before considering any task "Done", you MUST execute the following pipeline in o
 * `cargo clippy` returns zero warnings and zero errors.
 * All existing and newly written tests pass successfully.
 * Public items (`pub`) have explicit documentation comments (`///`).
+
+## 6. Starting / Testing a full setup
+* **use** `cargo run` to start the server and observe output
+* start **mqtt client** with `mosquitto_sub` with necessary parameters to connect to the broker
+

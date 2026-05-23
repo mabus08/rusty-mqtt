@@ -1,18 +1,119 @@
 use std::error::Error;
+use std::fmt;
+use std::path::Path;
+pub mod subscribe_handlers;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-pub mod subscribe_handlers;
+pub use subscribe_handlers::{SubscribeHandler, TopicRouter};
+
+const CONFIG_FILE_NAME: &str = "rusty-mqtt.toml";
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 1884;
+
+/// Fehler beim Laden der Broker-Konfiguration.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// TOML-Datei konnte nicht geparst werden.
+    ParseError(String),
+    /// Konfigurationswerte sind ungueltig.
+    ValidationError(String),
+    /// Dateisystemfehler beim Lesen der Datei.
+    IoError(std::io::Error),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::ParseError(msg) => write!(f, "Konfigurationsfehler: {}", msg),
+            ConfigError::ValidationError(msg) => write!(f, "Validierungsfehler: {}", msg),
+            ConfigError::IoError(err) => write!(f, "IO-Fehler: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Broker-Konfiguration mit Host und Port.
+#[derive(Debug, serde::Deserialize)]
+pub struct BrokerConfig {
+    /// Bind-Adresse des Brokers.
+    #[serde(default = "default_host")]
+    pub host: String,
+    /// Port des Brokers.
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
+fn default_host() -> String {
+    DEFAULT_HOST.to_string()
+}
+
+fn default_port() -> u16 {
+    DEFAULT_PORT
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+        }
+    }
+}
+
+impl BrokerConfig {
+    /// Laedt Konfiguration aus `rusty-mqtt.toml` im angegebenen Verzeichnis.
+    /// Fehlt die Datei, werden Defaults verwendet.
+    pub fn load_from(dir: &Path) -> Result<Self, ConfigError> {
+        let config_path = dir.join(CONFIG_FILE_NAME);
+
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        let content = std::fs::read_to_string(&config_path).map_err(ConfigError::IoError)?;
+
+        let config: BrokerConfig =
+            toml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+
+        config.validate()?;
+
+        Ok(config)
+    }
+
+    /// Prueft ob die Konfigurationswerte gueltig sind.
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.port == 0 {
+            return Err(ConfigError::ValidationError(
+                "Port darf nicht 0 sein".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Erzeugt die vollstaendige Bind-Adresse als String.
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum MqttPacket {
     Connect,
+    Subscribe(u16),
+    Unsubscribe(u16),
+    Publish(String),
     Disconnect,
+    PINGREQ,
+    PUBLISH,
     Unknown,
 }
 
+// Remove this field since we don't store subscribe_handler in new()
 pub struct MqttServer {
+    #[allow(unused)]
     address: String,
 }
 
@@ -23,46 +124,121 @@ impl MqttServer {
         }
     }
 
-    pub async fn run(&self) -> Result<(), Box<dyn Error>> {
+    /// Erstellt einen MqttServer aus einer BrokerConfig.
+    pub fn from_config(config: BrokerConfig) -> Self {
+        Self {
+            address: config.address(),
+        }
+    }
+
+    pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let listener = TcpListener::bind(&self.address).await?;
         let actual_addr = listener.local_addr()?;
         println!("MQTT Broker horcht auf: {}", actual_addr);
 
         loop {
-            let (socket, _) = listener.accept().await?;
+            let (socket, _) = match listener.accept().await {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("Akzeptieren fehlgeschlagen: {}", e);
+                    continue;
+                }
+            };
+
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(socket).await {
+                if let Err(e) = MqttServer::handle_connection(socket, actual_addr.port()).await {
                     eprintln!("Fehler in Client-Verbindung: {}", e);
                 }
             });
         }
     }
 
-    async fn handle_connection(mut socket: TcpStream) -> Result<(), Box<dyn Error>> {
+    async fn handle_connection(
+        mut socket: TcpStream,
+        port: u16,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut buffer = [0u8; 1024];
-        let timeout_duration = Duration::from_secs(5);
-        let bytes_read = match timeout(timeout_duration, socket.read(&mut buffer)).await {
-            Ok(result) => result?,
-            Err(_) => {
-                println!("😒 Client Timeout");
-                return Ok(()); // terminate connection
+        let timeout_duration = Duration::from_secs(300);
+
+        loop {
+            let bytes_read = match timeout(timeout_duration, socket.read(&mut buffer)).await {
+                Ok(result) => result.map_err(|e| format!("Read error on {}: {}", port, e))?,
+                Err(_) => {
+                    println!("😒 Client Timeout");
+                    return Ok(());
+                }
+            };
+
+            if bytes_read == 0 {
+                println!("Client disconnected");
+                return Ok(());
             }
-        };
 
-        if bytes_read == 0 {
-            return Ok(());
+            let packet_type = MqttServer::parse_packet(&buffer[..bytes_read]);
+
+            match packet_type {
+                MqttPacket::Connect => {
+                    let connack = [0x20, 0x02, 0x00, 0x00];
+                    socket.write_all(&connack).await?;
+                    println!(" ☎️ Connection successful");
+                }
+                MqttPacket::Subscribe(_packet_id) => {
+                    println!(" 👉 Subscribe received");
+                    let suback = handle_subscribe_impl(&buffer[..bytes_read]).await?;
+                    socket.write_all(&suback).await?;
+                    println!(" ✅ SUBACK sent");
+                }
+                MqttPacket::PINGREQ => {
+                    let pingresp = [0xD0, 0x00];
+                    socket.write_all(&pingresp).await?;
+                }
+                MqttPacket::Disconnect => {
+                    println!("Client sent DISCONNECT");
+                    return Ok(());
+                }
+                MqttPacket::Publish(_topic) => {
+                    // TODO: Publish handling with topic routing via TopicRouter
+                }
+                _ => {}
+            }
         }
-        let packet_type = Self::parse_packet(&buffer[..bytes_read]);
+    }
 
-        if packet_type == MqttPacket::Connect {
-            // MQTT CONNACK: [Fixed Header, Length, Flags, Return Code]
-            // 0x20 = CONNACK, 0x02 = 2 Bytes folgen, 0x00 = No Flags, 0x00 = Connection Accepted
-            let connack = [0x20, 0x02, 0x00, 0x00];
-            socket.write_all(&connack).await?;
-            println!("👍 Connection succesfull");
+    pub async fn handle_subscribe_impl(buffer: &[u8]) -> Result<Vec<u8>, String> {
+        if buffer.len() < 4 {
+            return Err("Buffer too short for SUBSCRIBE".to_string());
         }
 
-        Ok(())
+        let packet_id = ((buffer[2] as u16) << 8) | (buffer[3] as u16);
+
+        let mut topic_filters = Vec::new();
+        let mut offset = 4usize;
+
+        while offset + 2 < buffer.len() {
+            let topic_len = ((buffer[offset] as usize) << 8) | (buffer[offset + 1] as usize);
+            offset += 2;
+
+            if offset + topic_len >= buffer.len() {
+                break;
+            }
+
+            let topic = String::from_utf8_lossy(&buffer[offset..offset + topic_len]).to_string();
+            offset += topic_len;
+
+            if offset >= buffer.len() {
+                break;
+            }
+
+            let qos = buffer[offset];
+            offset += 1;
+
+            topic_filters.push((topic, qos));
+        }
+
+        Ok(SubscribeHandler::generate_suback(
+            packet_id,
+            topic_filters.len(),
+        ))
     }
 
     pub fn parse_packet(buffer: &[u8]) -> MqttPacket {
@@ -73,8 +249,43 @@ impl MqttServer {
         let control_packet_type = buffer[0] >> 4;
         match control_packet_type {
             1 => MqttPacket::Connect,
+            3 => MqttPacket::Publish(String::new()),
+            8 => {
+                if buffer.len() > 3 {
+                    let packet_id = ((buffer[2] as u16) << 8) | (buffer[3] as u16);
+                    MqttPacket::Subscribe(packet_id)
+                } else {
+                    MqttPacket::Unknown
+                }
+            }
+            12 => MqttPacket::PINGREQ,
             14 => MqttPacket::Disconnect,
             _ => MqttPacket::Unknown,
         }
+    }
+
+    pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
+        if buffer.len() > offset + 1 {
+            let byte1 = buffer[offset] & 0x0F;
+            let byte2 = buffer[offset + 1];
+            Ok((byte1 as u16) << 8 | byte2 as u16)
+        } else {
+            Err("Buffer zu kurz für Packet ID".into())
+        }
+    }
+}
+
+// Module exports for external use (when needed)
+pub async fn handle_subscribe_impl(buffer: &[u8]) -> Result<Vec<u8>, String> {
+    MqttServer::handle_subscribe_impl(buffer).await
+}
+
+pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
+    MqttServer::extract_packet_id(buffer, offset)
+}
+
+impl MqttServer {
+    pub fn get_address(&self) -> &str {
+        &self.address
     }
 }

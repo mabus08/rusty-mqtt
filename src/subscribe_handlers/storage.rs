@@ -1,76 +1,83 @@
-use std::sync::Arc;
 use std::collections::HashMap;
 
-/// Information eines Subscriber für message routing
-#[derive(Debug, Clone)]
-pub struct SubscriberSubscription {
-    /// Unique packet identifier for SUBSCRIBE/PUBACK correlation (2 byte)  
-    pub packet_id: u16,
-    
-    /// QoS level for message delivery  
-    pub qos: u8, // 0 = AtMostOnce, 1 = AtLeastOnce
-    
-    /// Topic filter pattern that this client subscribed to
-    pub topic_filter: String,
+pub struct TopicRouter {
+    subscriptions: HashMap<u16, String>, // packet_id -> topic_filter for MVP
 }
 
-/// Topic Router mit subscriber storage (client-centric)  
-/// Speichert: client_id → Liste von SubscriberSubscription structs
-pub struct TopicRouter {
-    /// Speicherung: client_id → Vec<SubscriberSubscription>
-    subscriptions: Arc<HashMap<String, Vec<SubscriberSubscription>>>,
+impl Default for TopicRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TopicRouter {
-    /// Erstellt neuen Topic Router mit leerem storage  
     pub fn new() -> Self {
-        let subscriptions = Arc::new(HashMap::new());
-        Self { subscriptions }
+        Self {
+            subscriptions: HashMap::new(),
+        }
     }
 
-    /// Registriert einen neuen Subscriber-Record  
-    /// 
-    /// # Arguments
-    /// - `client_id`: MQTT Client Identifier (Connect Packet)
-    /// - `topic_filter`: Topic Muster wie "/home" oder "/news/#"
-    /// - `packet_id`: SUBSCRIBE packet identifier (2 bytes)  
-    /// - `qos`: QoS level (0 oder 1)
-    pub fn register_subscription(&self, client_id: &str, topic_filter: &str, 
-                                packet_id: u16, qos: u8) {
-        let subscription = SubscriberSubscription {
-            packet_id,
-            qos,
-            topic_filter: topic_filter.to_string(),
-        };
-
-        self.subscriptions
-            .entry(client_id.to_string())
-            .or_insert_with(Vec::new)
-            .push(subscription);
+    pub fn subscribe(&mut self, packet_id: u16, filters: Vec<(String, u8)>) {
+        for (topic_filter, _) in &filters {
+            self.subscriptions
+                .insert(packet_id, topic_filter.clone());
+        }
     }
 
-    /// Rückgibt alle Subscribtions für einen Client-Topics (optional mit filtering)  
-    pub fn get_subscriptions(&self, client_id: &str) -> Option<Vec<SubscriberSubscription>> {
-        self.subscriptions.get(client_id).cloned()
+    pub fn get_subscriptions_for_topic(&self, topic: &str) -> Vec<u16> {
+        let mut result = Vec::new();
+
+        for (packet_id, filter) in &self.subscriptions {
+            if self.topic_matches(filter.as_str(), topic) {
+                result.push(*packet_id);
+                break;
+            }
+        }
+
+        result
     }
 
-    /// Zählt die Anzahl der Subscriptons für einen Client
-    pub fn subscription_count(&self, client_id: &str) -> usize {
-        *self.subscriptions.get(client_id).map(|v| v.len()).unwrap_or(&0)
-    }
+    fn topic_matches(&self, filter: &str, topic: &str) -> bool {
+        let p_bytes = filter.as_bytes();
+        let t_bytes = topic.as_bytes();
 
-    /// Gibt true falls client subscribtions existieren  
-    pub fn has_subscriptions(&self, client_id: &str) -> bool {
-        self.subscriptions.contains_key(client_id) && !self.subscription_count(client_id) == 0 
-    }
-    
-    /// Iteriert über alle Subscription für ein Topic (topic filtering später AP2+)
-    pub fn topics_for_client(&self, client_id: &str) -> Vec<SubscriberSubscription> {
-        self.subscriptions.get(client_id).cloned().unwrap_or_default()
+        if p_bytes == t_bytes {
+            return true;
+        }
+
+        if !p_bytes.contains(&b'+') && !p_bytes.contains(&b'#') {
+            return false;
+        }
+
+        let mut ip: usize = 0;
+        let mut it: usize = 0;
+
+        loop {
+            if ip >= p_bytes.len() && it >= t_bytes.len() {
+                return true;
+            }
+            if ip >= p_bytes.len() || it >= t_bytes.len() {
+                return false;
+            }
+
+            match *p_bytes.get(ip).unwrap_or(&0) {
+                b'+' => {
+                    ip += 1;
+                    it += 1;
+                }
+                b'#' => return true,
+                _ => {
+                    if p_bytes[ip] != t_bytes[it] {
+                        return false;
+                    }
+                    ip += 1;
+                    it += 1;
+                }
+            }
+        }
     }
 }
 
-/// Test-Funktion zum Reset (falls in Tests gebraucht)  
 pub fn create_router() -> TopicRouter {
     TopicRouter::new()
 }
