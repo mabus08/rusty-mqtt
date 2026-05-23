@@ -143,3 +143,45 @@ mod tests {
         ));
     }
 }
+
+/// Topic Router for storing subscriptions (AP2 deliverable)
+pub struct TopicRouter {
+    subscriptions: HashMap<u16, Vec<(String, u8)>>, // packet_id -> [(topic_filter, qos)]
+}
+
+impl TopicRouter {
+    pub fn new() -> Self {
+        Self {
+            subscriptions: HashMap::new(),
+        }
+    }
+    
+    /// Subscribe a client to topics (MVP implementation)
+    pub async fn subscribe(&mut self, packet_id: u16, filters: Vec<(String, u8)>) {
+        // Store subscription records keyed by packet_id for retrieval
+        self.subscriptions.insert(packet_id, filters);
+    }
+    
+    /// Get subscriptions for a specific topic (using wildcard matching)
+    pub fn get_subscribers_for_topic(&self, topic: &str) -> Vec<u16> {
+        let mut result = Vec::new();
+        
+        for (_packet_id, filter_topics) in &self.subscriptions {
+            for (filter, _) in filter_topics {
+                if SubscribeHandler::wildcard_match(filter, topic) {
+                    result.push(*_packet_id);
+                    break; // Avoid duplicate packet_ids
+                }
+            }
+        }
+        
+        result
+    }
+}
+
+impl Default for TopicRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
