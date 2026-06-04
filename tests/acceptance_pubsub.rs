@@ -831,6 +831,106 @@ async fn at11_keep_alive_zero_means_no_timeout() {
 }
 
 // ---------------------------------------------------------------------------
+// AT13 — Takeover: old session's subscriptions are fully cleaned up before
+//         new session registers its own
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at13_takeover_clears_old_subscriptions() {
+    let addr = spawn_broker().await;
+
+    // First session subscribes to "ghost/topic".
+    let mut first = TcpStream::connect(&addr).await.unwrap();
+    first.write_all(&connect_packet("same-id")).await.unwrap();
+    expect_connack_ok(&mut first).await;
+    first
+        .write_all(&subscribe_packet(1, "ghost/topic", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut first, 1, &[0x00]).await;
+
+    // Second session takes over with the same client id.
+    let mut second = TcpStream::connect(&addr).await.unwrap();
+    second.write_all(&connect_packet("same-id")).await.unwrap();
+    expect_connack_ok(&mut second).await;
+
+    // First must be kicked (EOF).
+    let mut buf = [0u8; 4];
+    let n = timeout(Duration::from_secs(2), first.read(&mut buf))
+        .await
+        .expect("first must be closed")
+        .expect("read");
+    assert_eq!(n, 0);
+
+    // Second session does NOT subscribe to "ghost/topic".
+    // A publisher now sends to "ghost/topic".
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&connect_packet("pub-ghost")).await.unwrap();
+    expect_connack_ok(&mut pubc).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pubc.write_all(&publish_packet("ghost/topic", b"ghost"))
+        .await
+        .unwrap();
+
+    // Second session must NOT receive this publish.
+    let mut rbuf = [0u8; 1];
+    let extra = timeout(Duration::from_millis(300), second.read(&mut rbuf)).await;
+    assert!(
+        extra.is_err(),
+        "second session must not receive ghost subscriptions from old session"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AT18 — DISCONNECT is treated as clean closure; subscriptions are removed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at18_disconnect_cleans_up_subscriptions() {
+    let addr = spawn_broker().await;
+
+    // Client connects, subscribes, then disconnects.
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
+    sub.write_all(&connect_packet("dc-client")).await.unwrap();
+    expect_connack_ok(&mut sub).await;
+    sub.write_all(&subscribe_packet(1, "dc/topic", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut sub, 1, &[0x00]).await;
+    sub.write_all(&[0xE0, 0x00]).await.unwrap(); // DISCONNECT
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A publisher sends to "dc/topic" — nobody should be subscribed.
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&connect_packet("pub-dc")).await.unwrap();
+    expect_connack_ok(&mut pubc).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // New independent subscriber verifies clean state: subscribes fresh.
+    let mut verify = TcpStream::connect(&addr).await.unwrap();
+    verify
+        .write_all(&connect_packet("dc-verify"))
+        .await
+        .unwrap();
+    expect_connack_ok(&mut verify).await;
+    verify
+        .write_all(&subscribe_packet(2, "dc/topic", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut verify, 2, &[0x00]).await;
+
+    pubc.write_all(&publish_packet("dc/topic", b"fresh"))
+        .await
+        .unwrap();
+    let pkt = timeout(Duration::from_secs(2), read_packet(&mut verify))
+        .await
+        .expect("fresh subscriber must receive the publish");
+    let body = &pkt[2..];
+    let tlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert_eq!(&body[2 + tlen..], b"fresh");
+}
+
+// ---------------------------------------------------------------------------
 // AT17 — CONNECT with reserved bit set -> close without CONNACK
 // ---------------------------------------------------------------------------
 
@@ -843,4 +943,68 @@ async fn at17_reserved_bit_set_closes_without_connack() {
         .await
         .unwrap();
     expect_close_without_response(&mut s).await;
+}
+
+// ---------------------------------------------------------------------------
+// AT19 — Slow subscriber: full channel drops frames, publisher not blocked
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at19_slow_subscriber_does_not_block_publisher() {
+    let addr = spawn_broker().await;
+
+    // A "slow" subscriber connects but never reads from its socket.
+    // Its mpsc channel (capacity 32) will fill up quickly.
+    let mut slow = TcpStream::connect(&addr).await.unwrap();
+    slow.write_all(&connect_packet("slow-sub")).await.unwrap();
+    expect_connack_ok(&mut slow).await;
+    slow.write_all(&subscribe_packet(1, "flood/topic", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut slow, 1, &[0x00]).await;
+
+    // A fast subscriber that actually reads.
+    let mut fast = TcpStream::connect(&addr).await.unwrap();
+    fast.write_all(&connect_packet("fast-sub")).await.unwrap();
+    expect_connack_ok(&mut fast).await;
+    fast.write_all(&subscribe_packet(2, "flood/topic", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut fast, 2, &[0x00]).await;
+
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&connect_packet("flooder")).await.unwrap();
+    expect_connack_ok(&mut pubc).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Flood with more messages than the channel capacity (32).
+    // The publisher must not hang.
+    let flood_count = 50usize;
+    let start = std::time::Instant::now();
+    for i in 0..flood_count {
+        let payload = format!("{}", i);
+        pubc.write_all(&publish_packet("flood/topic", payload.as_bytes()))
+            .await
+            .unwrap();
+    }
+    let elapsed = start.elapsed();
+    // Publishing 50 frames must complete well within 1s (drop-on-full guarantee).
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "publishing must not block due to slow subscriber; took {:?}",
+        elapsed
+    );
+
+    // Fast subscriber must have received at least some messages.
+    let mut received = 0usize;
+    while let Ok(_pkt) = timeout(Duration::from_millis(200), read_packet(&mut fast)).await {
+        received += 1;
+        if received >= flood_count {
+            break;
+        }
+    }
+    assert!(
+        received > 0,
+        "fast subscriber must receive at least some publishes"
+    );
 }
