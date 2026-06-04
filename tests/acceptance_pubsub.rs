@@ -364,3 +364,54 @@ async fn at4_large_binary_payload_byte_exact() {
     assert_eq!(&body[2..2 + topic_len], b"bin/data");
     assert_eq!(&body[2 + topic_len..], &payload[..], "payload byte-exact");
 }
+
+// ---------------------------------------------------------------------------
+// AT12 — Client-ID takeover: second CONNECT with same client id kicks the first
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at12_second_connect_with_same_client_id_kicks_first() {
+    let addr = spawn_broker().await;
+
+    // First session establishes itself.
+    let mut first = TcpStream::connect(&addr).await.unwrap();
+    first.write_all(&connect_packet("dup-id")).await.unwrap();
+    expect_connack_ok(&mut first).await;
+
+    // Second session with the same client id.
+    let mut second = TcpStream::connect(&addr).await.unwrap();
+    second.write_all(&connect_packet("dup-id")).await.unwrap();
+    expect_connack_ok(&mut second).await;
+
+    // The first socket must observe a close (EOF) from the broker.
+    let mut probe = [0u8; 16];
+    let n = timeout(Duration::from_secs(2), first.read(&mut probe))
+        .await
+        .expect("first socket should be closed by broker after takeover")
+        .expect("read on closed socket");
+    assert_eq!(n, 0, "first socket must read 0 bytes (EOF) after takeover");
+
+    // The second session must still work: subscribe + receive from a third pub.
+    second
+        .write_all(&subscribe_packet(1, "takeover/check", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut second, 1, &[0x00]).await;
+
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&connect_packet("pub-takeover"))
+        .await
+        .unwrap();
+    expect_connack_ok(&mut pubc).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pubc.write_all(&publish_packet("takeover/check", b"ok"))
+        .await
+        .unwrap();
+
+    let pkt = timeout(Duration::from_secs(2), read_packet(&mut second))
+        .await
+        .expect("second (new) session must receive the publish");
+    let body = &pkt[2..];
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert_eq!(&body[2 + topic_len..], b"ok");
+}

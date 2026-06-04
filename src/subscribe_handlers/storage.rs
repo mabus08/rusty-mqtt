@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use bytes::Bytes;
 use tokio::sync::mpsc;
+
+use crate::client_registry::ConnectionCommand;
 
 /// Ein einzelner Subscriber fuer ein Topic.
 ///
@@ -14,7 +15,7 @@ pub struct Subscriber {
     /// Vom Broker gewaehrter QoS-Wert (`granted_qos`).
     pub qos: u8,
     /// Channel-Sender zum Connection Task; vorgerenderte Frames gehen hier rein.
-    pub tx: mpsc::Sender<Bytes>,
+    pub tx: mpsc::Sender<ConnectionCommand>,
 }
 
 /// Globaler Topic Router: speichert Subscriptions nach Topic Filter.
@@ -43,7 +44,7 @@ impl TopicRouter {
         &mut self,
         client_id: &str,
         filters: &[(String, u8)],
-        tx: &mpsc::Sender<Bytes>,
+        tx: &mpsc::Sender<ConnectionCommand>,
     ) -> Vec<u8> {
         let mut granted_qos = Vec::with_capacity(filters.len());
 
@@ -141,7 +142,7 @@ pub fn create_router() -> TopicRouter {
 mod tests {
     use super::*;
 
-    fn dummy_tx() -> mpsc::Sender<Bytes> {
+    fn dummy_tx() -> mpsc::Sender<ConnectionCommand> {
         let (tx, _rx) = mpsc::channel(1);
         tx
     }

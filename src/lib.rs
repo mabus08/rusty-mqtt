@@ -2,12 +2,15 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+pub mod client_registry;
 pub mod subscribe_handlers;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
+
+use crate::client_registry::{ClientRegistry, ConnectionCommand};
 
 pub use subscribe_handlers::{SubscribeHandler, TopicRouter};
 
@@ -120,6 +123,7 @@ pub struct MqttServer {
     #[allow(unused)]
     address: String,
     topic_router: Arc<Mutex<TopicRouter>>,
+    client_registry: Arc<ClientRegistry>,
 }
 
 impl MqttServer {
@@ -127,6 +131,7 @@ impl MqttServer {
         Self {
             address: addr.to_string(),
             topic_router: Arc::new(Mutex::new(TopicRouter::new())),
+            client_registry: Arc::new(ClientRegistry::new()),
         }
     }
 
@@ -135,6 +140,7 @@ impl MqttServer {
         Self {
             address: config.address(),
             topic_router: Arc::new(Mutex::new(TopicRouter::new())),
+            client_registry: Arc::new(ClientRegistry::new()),
         }
     }
 
@@ -153,8 +159,9 @@ impl MqttServer {
             };
 
             let router = Arc::clone(&self.topic_router);
+            let registry = Arc::clone(&self.client_registry);
             tokio::spawn(async move {
-                if let Err(e) = MqttServer::handle_connection(socket, router).await {
+                if let Err(e) = MqttServer::handle_connection(socket, router, registry).await {
                     eprintln!("Fehler in Client-Verbindung: {}", e);
                 }
             });
@@ -164,12 +171,13 @@ impl MqttServer {
     async fn handle_connection(
         socket: TcpStream,
         router: Arc<Mutex<TopicRouter>>,
+        registry: Arc<ClientRegistry>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut reader, mut writer) = socket.into_split();
         let mut buffer = [0u8; 1024];
         let timeout_duration = Duration::from_secs(300);
         let mut client_id: Option<String> = None;
-        let (tx, mut rx) = mpsc::channel::<Bytes>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx, mut rx) = mpsc::channel::<ConnectionCommand>(SUBSCRIBER_CHANNEL_CAPACITY);
 
         loop {
             tokio::select! {
@@ -198,7 +206,16 @@ impl MqttServer {
                         MqttPacket::Connect => {
                             let parsed_client_id = MqttServer::parse_connect_client_id(frame);
                             println!("Connection from client: {:?}", parsed_client_id);
+
+                            // Takeover (ADR-0004): vor CONNACK alte Session synchron
+                            // beenden, damit deren Cleanup vor unseren Subscriptions
+                            // laeuft.
+                            if let Some(old) = registry.swap_in(&parsed_client_id, tx.clone()) {
+                                let _ = old.send(ConnectionCommand::Disconnect).await;
+                                old.closed().await;
+                            }
                             client_id = Some(parsed_client_id);
+
                             let connack = [0x20, 0x02, 0x00, 0x00];
                             writer.write_all(&connack).await?;
                         }
@@ -222,7 +239,7 @@ impl MqttServer {
                                 let outbound = encode_publish(&topic, &payload);
                                 let bytes = Bytes::from(outbound);
                                 // Snapshot der zustaendigen Sender, dann Lock freigeben.
-                                let senders: Vec<mpsc::Sender<Bytes>> = match router.lock() {
+                                let senders: Vec<mpsc::Sender<ConnectionCommand>> = match router.lock() {
                                     Ok(r) => r
                                         .get_subscribers_for_topic(&topic)
                                         .into_iter()
@@ -231,7 +248,7 @@ impl MqttServer {
                                     Err(_) => Vec::new(),
                                 };
                                 for s in senders {
-                                    let _ = s.try_send(bytes.clone()); // drop-on-full
+                                    let _ = s.try_send(ConnectionCommand::DeliverFrame(bytes.clone())); // drop-on-full
                                 }
                             }
                         }
@@ -240,17 +257,26 @@ impl MqttServer {
                     }
                     if should_break { break; }
                 }
-                Some(frame) = rx.recv() => {
-                    writer.write_all(&frame).await?;
+                Some(cmd) = rx.recv() => {
+                    match cmd {
+                        ConnectionCommand::DeliverFrame(frame) => {
+                            writer.write_all(&frame).await?;
+                        }
+                        ConnectionCommand::Disconnect => {
+                            // Vom Broker angeordnetes Beenden (z.B. Takeover).
+                            break;
+                        }
+                    }
                 }
             }
         }
 
-        // Client-Subscriptions aufraeumen bei Disconnect/Timeout
-        if let Some(ref cid) = client_id
-            && let Ok(mut r) = router.lock()
-        {
-            r.remove_client(cid);
+        // Cleanup-Pfad: Router + Registry. Single source of truth.
+        if let Some(ref cid) = client_id {
+            if let Ok(mut r) = router.lock() {
+                r.remove_client(cid);
+            }
+            registry.remove_if_owner(cid, &tx);
         }
 
         Ok(())
@@ -262,7 +288,7 @@ impl MqttServer {
         buffer: &[u8],
         client_id: &str,
         router: &Arc<Mutex<TopicRouter>>,
-        tx: &mpsc::Sender<Bytes>,
+        tx: &mpsc::Sender<ConnectionCommand>,
     ) -> Result<Vec<u8>, String> {
         if buffer.len() < 4 {
             return Err("Buffer too short for SUBSCRIBE".to_string());
