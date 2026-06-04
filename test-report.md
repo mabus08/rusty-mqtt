@@ -1,16 +1,16 @@
-# Test-Bericht - rusty-mqtt
+# Test Report - rusty-mqtt
 
-## Zusammenfassung
-**Status**: ✅ Alle Tests erfolgreich
+## Summary
+**Status**: ✅ All tests passed
 
-## Durchgeführte Tests
+## Tests Executed
 
-### Unit/Integrationstests
-| Testname | Ergebnis | Dauer |
+### Unit/Integration Tests
+| Test Name | Result | Duration |
 |----------|----------|-------|
 | `test_external_connection` | ✅ passed | ~50ms |
 
-### Testergebnis
+### Test Results
 - **Passed**: 1
 - **Failed**: 0
 - **Ignored**: 0
@@ -20,16 +20,16 @@
 - Connection handshake (TCP accept)
 - MQTT Connect packet parsing (Control Packet Type = 1)
 - CONNACK response generation
-- Timeout handling für Client-Verbindungen
-- Response-Paket-Validierung (0x20 CONNACK Typ)
+- Timeout handling for client connections
+- Response packet validation (0x20 CONNACK type)
 
 ## Observations
-✅ Server-Start auf dynamischem Port (1885 im Test)  
-✅ Clients können sich verbinden und Pakete senden  
-✅ Response-Pakete werden korrekt generiert  
-✅ Tests sind asynchron mit Tokio  
+✅ Server start on dynamic port (1885 in test)
+✅ Clients can connect and send packets
+✅ Response packets are generated correctly
+✅ Tests are asynchronous with Tokio
 
-## Nächste Schritte
-- Erweiterte MQTT Packet-Typen (PUBLISH, SUBSCRIBE etc.)
-- Topic-Filtering & Routing
+## Next Steps
+- Extended MQTT packet types (PUBLISH, SUBSCRIBE etc.)
+- Topic filtering & routing
 - Session persistence

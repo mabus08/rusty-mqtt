@@ -1,8 +1,8 @@
 //! `rusty-mqtt` — MQTT 3.1.1 Broker MVP (QoS 0).
 //!
-//! Enthaelt den [`MqttServer`]-Accept-Loop, den Connection Task mit Keep-Alive-
-//! und Fanout-Logik, sowie Hilfsmodule fuer Codec-Vorstufen, Topic-Routing und
-//! Client-Registry.
+//! Contains the [`MqttServer`] accept loop, the Connection Task with Keep-Alive
+//! and fanout logic, as well as helper modules for codec pre-stages, topic routing
+//! and the client registry.
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -24,36 +24,36 @@ const CONFIG_FILE_NAME: &str = "rusty-mqtt.toml";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 1884;
 
-/// Fehler beim Laden der Broker-Konfiguration.
+/// Error loading the broker configuration.
 #[derive(Debug)]
 pub enum ConfigError {
-    /// TOML-Datei konnte nicht geparst werden.
+    /// TOML file could not be parsed.
     ParseError(String),
-    /// Konfigurationswerte sind ungueltig.
+    /// Configuration values are invalid.
     ValidationError(String),
-    /// Dateisystemfehler beim Lesen der Datei.
+    /// File-system error while reading the file.
     IoError(std::io::Error),
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::ParseError(msg) => write!(f, "Konfigurationsfehler: {}", msg),
-            ConfigError::ValidationError(msg) => write!(f, "Validierungsfehler: {}", msg),
-            ConfigError::IoError(err) => write!(f, "IO-Fehler: {}", err),
+            ConfigError::ParseError(msg) => write!(f, "Configuration error: {}", msg),
+            ConfigError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
+            ConfigError::IoError(err) => write!(f, "IO error: {}", err),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
 
-/// Broker-Konfiguration mit Host und Port.
+/// Broker configuration with host and port.
 #[derive(Debug, serde::Deserialize)]
 pub struct BrokerConfig {
-    /// Bind-Adresse des Brokers.
+    /// Bind address of the broker.
     #[serde(default = "default_host")]
     pub host: String,
-    /// Port des Brokers.
+    /// Port of the broker.
     #[serde(default = "default_port")]
     pub port: u16,
 }
@@ -76,8 +76,8 @@ impl Default for BrokerConfig {
 }
 
 impl BrokerConfig {
-    /// Laedt Konfiguration aus `rusty-mqtt.toml` im angegebenen Verzeichnis.
-    /// Fehlt die Datei, werden Defaults verwendet.
+    /// Loads configuration from `rusty-mqtt.toml` in the given directory.
+    /// If the file is missing, defaults are used.
     pub fn load_from(dir: &Path) -> Result<Self, ConfigError> {
         let config_path = dir.join(CONFIG_FILE_NAME);
 
@@ -95,53 +95,52 @@ impl BrokerConfig {
         Ok(config)
     }
 
-    /// Prueft ob die Konfigurationswerte gueltig sind.
+    /// Checks whether the configuration values are valid.
     fn validate(&self) -> Result<(), ConfigError> {
         if self.port == 0 {
             return Err(ConfigError::ValidationError(
-                "Port darf nicht 0 sein".to_string(),
+                "Port must not be 0".to_string(),
             ));
         }
         Ok(())
     }
 
-    /// Erzeugt die vollstaendige Bind-Adresse als String.
+    /// Returns the full bind address as a string.
     pub fn address(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
 }
 
-/// Capacity des per-Connection mpsc-Channels fuer auszuliefernde Frames.
+/// Capacity of the per-connection mpsc channel for frames to be delivered.
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 32;
 
-/// Maximaler vom Broker unterstuetzter QoS-Level.
-/// Wird hochgesetzt, sobald QoS 1/2 implementiert ist.
+/// Maximum QoS level supported by the broker.
+/// Raised once QoS 1/2 is implemented.
 const MAX_SUPPORTED_QOS: u8 = 0;
 
-/// Klassifikation eines eingehenden MQTT Control Packets (wire-level Typ).
+/// Classification of an incoming MQTT Control Packet (wire-level type).
 ///
-/// Wird von `parse_packet` aus dem Fixed-Header-Byte extrahiert und
-/// im Connection-Task-Match verwendet. Ersetzt spaeter durch den vollstaendigen
-/// `MqttPacket`-Codec.
+/// Extracted from the Fixed Header byte by `parse_packet` and used in the
+/// Connection Task match. Replaced later by the full `MqttPacket` codec.
 #[derive(Debug, PartialEq)]
 pub enum MqttPacket {
-    /// CONNECT (Typ 1).
+    /// CONNECT (type 1).
     Connect,
-    /// SUBSCRIBE (Typ 8) mit Packet Identifier.
+    /// SUBSCRIBE (type 8) with Packet Identifier.
     Subscribe(u16),
-    /// UNSUBSCRIBE (Typ 10) mit Packet Identifier.
+    /// UNSUBSCRIBE (type 10) with Packet Identifier.
     Unsubscribe(u16),
-    /// PUBLISH (Typ 3) mit Topic (noch nicht vollstaendig geparst).
+    /// PUBLISH (type 3) with topic (not yet fully parsed).
     Publish(String),
-    /// DISCONNECT (Typ 14).
+    /// DISCONNECT (type 14).
     Disconnect,
-    /// PINGREQ (Typ 12).
+    /// PINGREQ (type 12).
     PINGREQ,
-    /// Unbekannter oder nicht unterstuetzter Pakettyp.
+    /// Unknown or unsupported packet type.
     Unknown,
 }
 
-/// MQTT-Broker-Server; haelt Listener-Adresse, TopicRouter und ClientRegistry.
+/// MQTT broker server; holds the listener address, TopicRouter and ClientRegistry.
 pub struct MqttServer {
     #[allow(unused)]
     address: String,
@@ -150,7 +149,7 @@ pub struct MqttServer {
 }
 
 impl MqttServer {
-    /// Erstellt einen neuen `MqttServer` der auf `addr` (z.B. `"127.0.0.1:1883"`) lauschen wird.
+    /// Creates a new `MqttServer` that will listen on `addr` (e.g. `"127.0.0.1:1883"`).
     pub fn new(addr: &str) -> Self {
         Self {
             address: addr.to_string(),
@@ -159,7 +158,7 @@ impl MqttServer {
         }
     }
 
-    /// Erstellt einen MqttServer aus einer BrokerConfig.
+    /// Creates an `MqttServer` from a `BrokerConfig`.
     pub fn from_config(config: BrokerConfig) -> Self {
         Self {
             address: config.address(),
@@ -168,19 +167,19 @@ impl MqttServer {
         }
     }
 
-    /// Bindet den TCP-Listener und startet die Accept-Loop.
+    /// Binds the TCP listener and starts the accept loop.
     ///
-    /// Laeuft bis zum Prozess-Ende (kein Graceful Shutdown im MVP).
+    /// Runs until process exit (no graceful shutdown in MVP).
     pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let listener = TcpListener::bind(&self.address).await?;
         let actual_addr = listener.local_addr()?;
-        info!(address = %actual_addr, "MQTT Broker horcht auf");
+        info!(address = %actual_addr, "MQTT broker listening on");
 
         loop {
             let (socket, _) = match listener.accept().await {
                 Ok(result) => result,
                 Err(e) => {
-                    error!(error = %e, "Akzeptieren fehlgeschlagen");
+                    error!(error = %e, "Accept failed");
                     continue;
                 }
             };
@@ -189,7 +188,7 @@ impl MqttServer {
             let registry = Arc::clone(&self.client_registry);
             tokio::spawn(async move {
                 if let Err(e) = MqttServer::handle_connection(socket, router, registry).await {
-                    error!(error = %e, "Fehler in Client-Verbindung");
+                    error!(error = %e, "Error in client connection");
                 }
             });
         }
@@ -205,22 +204,22 @@ impl MqttServer {
         let timeout_duration = Duration::from_secs(300);
         let mut client_id: Option<String> = None;
         let (tx, mut rx) = mpsc::channel::<ConnectionCommand>(SUBSCRIBER_CHANNEL_CAPACITY);
-        // Keep-Alive: 0 bedeutet deaktiviert; ansonsten 1.5 × keep_alive_secs.
-        // keep_alive_millis == 0 => kein Timeout-Arm aktiv.
+        // Keep-Alive: 0 means disabled; otherwise 1.5 × keep_alive_secs.
+        // keep_alive_millis == 0 => no timeout arm active.
         let mut keep_alive_millis: u64 = 0;
         let mut keep_alive_deadline: Option<tokio::time::Instant> = None;
         let far_future = tokio::time::Instant::now() + Duration::from_secs(u32::MAX as u64);
 
         loop {
-            // Deadline fuer den Keep-Alive-Arm: liegt sie in der Vergangenheit
-            // oder ist kein Keep-Alive konfiguriert, warten wir auf far_future
-            // (effektiv deaktiviert).
+            // Deadline for the Keep-Alive arm: if it is in the past
+            // or no Keep-Alive is configured, we wait on far_future
+            // (effectively disabled).
             let ka_instant = keep_alive_deadline.unwrap_or(far_future);
 
             tokio::select! {
                 _ = tokio::time::sleep_until(ka_instant), if keep_alive_deadline.is_some() => {
-                    // Keep-Alive abgelaufen — Verbindung schliessen.
-                    debug!(client_id = ?client_id, "Keep-Alive Timeout");
+                    // Keep-Alive expired — close connection.
+                    debug!(client_id = ?client_id, "Keep-Alive timeout");
                     break;
                 }
                 read_result = timeout(timeout_duration, reader.read(&mut buffer)) => {
@@ -233,7 +232,7 @@ impl MqttServer {
                         debug!(client_id = ?client_id, "Client disconnected");
                         break;
                     }
-                    // Jedes eingehende Frame setzt den Keep-Alive-Timer zurueck.
+                    // Every incoming frame resets the Keep-Alive timer.
                     if keep_alive_millis > 0 {
                         keep_alive_deadline = Some(
                             tokio::time::Instant::now()
@@ -244,8 +243,8 @@ impl MqttServer {
                     let mut should_break = false;
                     while let Some(len) = frame_length(data) {
                         if len > data.len() {
-                            // partial frame at buffer tail — MVP-Annahme: read() liefert
-                            // ganze Frames. Wird mit Framed in spaeterer Phase robuster.
+                            // Partial frame at buffer tail — MVP assumption: read() delivers
+                            // complete frames. Will be made more robust with Framed in a later phase.
                             break;
                         }
                         let frame = &data[..len];
@@ -260,7 +259,7 @@ impl MqttServer {
                                 } => {
                                     info!(client_id = %parsed_client_id, "Client connected");
 
-                                    // Keep-Alive konfigurieren: Deadline = 1.5 × keep_alive.
+                                    // Configure Keep-Alive: deadline = 1.5 × keep_alive.
                                     if keep_alive_secs > 0 {
                                         keep_alive_millis =
                                             (keep_alive_secs as u64) * 1500;
@@ -270,9 +269,8 @@ impl MqttServer {
                                         );
                                     }
 
-                                    // Takeover (ADR-0004): vor CONNACK alte Session synchron
-                                    // beenden, damit deren Cleanup vor unseren Subscriptions
-                                    // laeuft.
+                                    // Takeover (ADR-0004): synchronously terminate the old session
+                                    // before CONNACK so that its cleanup runs before our subscriptions.
                                     if let Some(old) =
                                         registry.swap_in(&parsed_client_id, tx.clone())
                                     {
@@ -286,7 +284,7 @@ impl MqttServer {
                                 }
                                 ConnectValidation::BadProtocolName
                                 | ConnectValidation::ReservedBitSet => {
-                                    // Malformed: Socket schliessen ohne CONNACK.
+                                    // Malformed: close socket without CONNACK.
                                     should_break = true;
                                     break;
                                 }
@@ -339,7 +337,7 @@ impl MqttServer {
                                 debug!(client_id = ?client_id, topic = %topic, bytes = payload.len(), "PUBLISH routed");
                                 let outbound = encode_publish(&topic, &payload);
                                 let bytes = Bytes::from(outbound);
-                                // Snapshot der zustaendigen Sender, dann Lock freigeben.
+                                // Snapshot the relevant senders, then release the lock.
                                 let senders: Vec<mpsc::Sender<ConnectionCommand>> = match router.lock() {
                                     Ok(r) => r
                                         .get_subscribers_for_topic(&topic)
@@ -352,7 +350,7 @@ impl MqttServer {
                                     let _ = s.try_send(ConnectionCommand::DeliverFrame(bytes.clone())); // drop-on-full
                                 }
                             } else {
-                                warn!(client_id = ?client_id, "PUBLISH verworfen (Wildcard-Topic oder QoS > 0)");
+                                warn!(client_id = ?client_id, "PUBLISH dropped (wildcard topic or QoS > 0)");
                             }
                         }
                         _ => {}
@@ -366,7 +364,7 @@ impl MqttServer {
                             writer.write_all(&frame).await?;
                         }
                         ConnectionCommand::Disconnect => {
-                            // Vom Broker angeordnetes Beenden (z.B. Takeover).
+                            // Server-initiated termination (e.g. takeover).
                             break;
                         }
                     }
@@ -374,7 +372,7 @@ impl MqttServer {
             }
         }
 
-        // Cleanup-Pfad: Router + Registry. Single source of truth.
+        // Cleanup path: router + registry. Single source of truth.
         if let Some(ref cid) = client_id {
             if let Ok(mut r) = router.lock() {
                 r.remove_client(cid);
@@ -385,8 +383,8 @@ impl MqttServer {
         Ok(())
     }
 
-    /// Parst ein SUBSCRIBE-Paket, speichert Subscriptions im Router,
-    /// und gibt ein SUBACK mit den korrekten granted QoS-Werten zurueck.
+    /// Parses a SUBSCRIBE packet, stores subscriptions in the router,
+    /// and returns a SUBACK with the correct granted QoS values.
     pub fn handle_subscribe_impl(
         buffer: &[u8],
         client_id: &str,
@@ -420,14 +418,14 @@ impl MqttServer {
             let qos = buffer[offset];
             offset += 1;
 
-            // QoS auf das Broker-Maximum cappen (silent downgrade per Spec).
-            // MAX_SUPPORTED_QOS == 0 => immer 0 im MVP.
+            // Cap QoS at the broker maximum (silent downgrade per spec).
+            // MAX_SUPPORTED_QOS == 0 => always 0 in MVP.
             #[allow(clippy::unnecessary_min_or_max)]
             let granted = qos.min(MAX_SUPPORTED_QOS);
             topic_filters.push((topic, granted));
         }
 
-        // Subscriptions im Router speichern und granted QoS erhalten
+        // Store subscriptions in the router and obtain granted QoS values.
         let granted_qos = router
             .lock()
             .map_err(|e| format!("Router lock failed: {}", e))?
@@ -436,20 +434,20 @@ impl MqttServer {
         Ok(SubscribeHandler::generate_suback(packet_id, &granted_qos))
     }
 
-    /// Extrahiert die Client ID aus einem CONNECT-Paket (MQTT 3.1.1).
+    /// Extracts the Client ID from a CONNECT packet (MQTT 3.1.1).
     ///
-    /// CONNECT Layout:
+    /// CONNECT layout:
     ///   Byte 0:    Fixed Header (0x10)
     ///   Byte 1:    Remaining Length
     ///   Byte 2-8:  Variable Header (Protocol Name "MQTT" + Protocol Level + Connect Flags + Keep Alive)
-    ///   Payload:   Client ID (UTF-8 length-prefixed String)
+    ///   Payload:   Client ID (UTF-8 length-prefixed string)
     pub fn parse_connect_client_id(buffer: &[u8]) -> String {
         // Minimum: Fixed Header (2) + Variable Header (10) + Client ID Length (2) = 14
         if buffer.len() < 14 {
             return "unknown".to_string();
         }
 
-        // Remaining Length (simplified: single-byte encoding, ausreichend fuer MVP)
+        // Remaining Length (simplified: single-byte encoding, sufficient for MVP)
         let remaining_start = 2usize;
 
         // Variable Header: 7 bytes Protocol Name ("MQTT") + Level + Flags + Keep Alive
@@ -473,7 +471,7 @@ impl MqttServer {
             .to_string()
     }
 
-    /// Extrahiert den Pakettyp aus dem Fixed-Header-Byte eines MQTT-Frames.
+    /// Extracts the packet type from the Fixed Header byte of an MQTT frame.
     pub fn parse_packet(buffer: &[u8]) -> MqttPacket {
         if buffer.is_empty() {
             return MqttPacket::Unknown;
@@ -506,14 +504,14 @@ impl MqttServer {
         }
     }
 
-    /// Liest eine 2-Byte-Packet-ID aus `buffer` ab `offset`.
+    /// Reads a 2-byte Packet ID from `buffer` at `offset`.
     pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
         if buffer.len() > offset + 1 {
             let byte1 = buffer[offset] & 0x0F;
             let byte2 = buffer[offset + 1];
             Ok((byte1 as u16) << 8 | byte2 as u16)
         } else {
-            Err("Buffer zu kurz fuer Packet ID".into())
+            Err("Buffer too short for Packet ID".into())
         }
     }
 
@@ -522,51 +520,51 @@ impl MqttServer {
     }
 }
 
-/// Liest eine 2-Byte-Packet-ID aus `buffer` ab `offset`.
+/// Reads a 2-byte Packet ID from `buffer` at `offset`.
 ///
-/// Delegiert an [`MqttServer::extract_packet_id`].
+/// Delegates to [`MqttServer::extract_packet_id`].
 pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
     MqttServer::extract_packet_id(buffer, offset)
 }
 
-/// Klassifikation des CONNECT-Pakets nach MQTT-3.1.1-Validierung.
+/// Classification of a CONNECT packet according to MQTT 3.1.1 validation.
 ///
-/// Vier beobachtbare Pfade gemaess Spec / PRD 0001:
-/// - `Ok`        — CONNACK 0x00, Session faehrt fort.
-/// - `BadProtocolName` — Frame als malformed verwerfen, Socket schliessen ohne CONNACK.
-/// - `BadProtocolLevel` — CONNACK mit Return Code 0x01, dann schliessen.
-/// - `ReservedBitSet`  — Frame als malformed verwerfen, Socket schliessen ohne CONNACK.
-/// - `EmptyClientId`   — CONNACK mit Return Code 0x02, dann schliessen.
+/// Four observable paths per spec / PRD 0001:
+/// - `Ok`              — CONNACK 0x00, session proceeds.
+/// - `BadProtocolName` — discard frame as malformed, close socket without CONNACK.
+/// - `BadProtocolLevel`— CONNACK with Return Code 0x01, then close.
+/// - `ReservedBitSet`  — discard frame as malformed, close socket without CONNACK.
+/// - `EmptyClientId`   — CONNACK with Return Code 0x02, then close.
 #[derive(Debug)]
 pub enum ConnectValidation {
-    /// Gueltiger CONNECT, Client-ID und Keep-Alive extrahiert.
+    /// Valid CONNECT; Client ID and Keep-Alive extracted.
     Ok {
-        /// Client-ID aus der Payload.
+        /// Client ID from the payload.
         client_id: String,
-        /// Keep-Alive-Intervall in Sekunden (0 = deaktiviert).
+        /// Keep-Alive interval in seconds (0 = disabled).
         keep_alive_secs: u16,
     },
     /// Protocol Name ≠ "MQTT".
     BadProtocolName,
     /// Protocol Level ≠ 4 (3.1.1).
     BadProtocolLevel,
-    /// Reserved-Bit (Bit 0 der Connect Flags) gesetzt.
+    /// Reserved bit (bit 0 of Connect Flags) is set.
     ReservedBitSet,
-    /// Payload-Client-ID-String ist leer.
+    /// Payload Client ID string is empty.
     EmptyClientId,
 }
 
-/// Validiert ein CONNECT-Frame und klassifiziert das Ergebnis.
+/// Validates a CONNECT frame and classifies the result.
 ///
-/// Erwartet das vollstaendige Frame inkl. Fixed Header. Multibyte-Varint
-/// (bis 4 Bytes) wird beruecksichtigt.
+/// Expects the complete frame including Fixed Header. Multi-byte Varint
+/// (up to 4 bytes) is handled.
 pub fn validate_connect(buffer: &[u8]) -> ConnectValidation {
-    // Mindestlaenge: Fixed Header (>=2) + Variable Header (10) + Client ID Length (2)
+    // Minimum length: Fixed Header (>=2) + Variable Header (10) + Client ID Length (2)
     if buffer.is_empty() || (buffer[0] & 0xF0) != 0x10 {
         return ConnectValidation::BadProtocolName;
     }
 
-    // Varint Remaining Length ueberspringen
+    // Skip Varint Remaining Length
     let mut offset = 1usize;
     let mut multiplier: usize = 1;
     let mut remaining: usize = 0;
@@ -621,7 +619,7 @@ pub fn validate_connect(buffer: &[u8]) -> ConnectValidation {
         return ConnectValidation::ReservedBitSet;
     }
 
-    // Keep Alive (2 bytes) lesen
+    // Read Keep Alive (2 bytes)
     if offset + 2 > body_end {
         return ConnectValidation::BadProtocolName;
     }
@@ -649,8 +647,8 @@ pub fn validate_connect(buffer: &[u8]) -> ConnectValidation {
     }
 }
 
-/// Bestimmt die Gesamtlaenge eines Frames (Fixed Header + Varint + Remaining Length).
-/// Liefert `None` wenn `buffer` zu kurz ist, um die Varint vollstaendig zu lesen.
+/// Determines the total length of a frame (Fixed Header + Varint + Remaining Length).
+/// Returns `None` if `buffer` is too short to fully read the Varint.
 fn frame_length(buffer: &[u8]) -> Option<usize> {
     if buffer.is_empty() {
         return None;
@@ -673,17 +671,17 @@ fn frame_length(buffer: &[u8]) -> Option<usize> {
     None
 }
 
-/// Parst ein eingehendes QoS-0-PUBLISH-Frame und liefert `(topic, payload)`.
-/// Gibt `None` zurueck wenn das Frame nicht parsierbar ist (zu kurz, ungueltige
-/// Topic-Laenge etc.). Multi-Byte-Varint wird bis 4 Bytes unterstuetzt.
+/// Parses an incoming QoS-0 PUBLISH frame and returns `(topic, payload)`.
+/// Returns `None` if the frame cannot be parsed (too short, invalid topic
+/// length, etc.). Multi-byte Varint is supported up to 4 bytes.
 fn parse_publish(buffer: &[u8]) -> Option<(String, Bytes)> {
     if buffer.is_empty() || (buffer[0] & 0xF0) != 0x30 {
         return None;
     }
-    // QoS aus Fixed Header
+    // QoS from Fixed Header
     let qos = (buffer[0] >> 1) & 0x03;
     if qos != 0 {
-        // MAX_SUPPORTED_QOS = 0 — alles andere wird im MVP verworfen.
+        // MAX_SUPPORTED_QOS = 0 — everything else is dropped in MVP.
         return None;
     }
 
@@ -728,7 +726,7 @@ fn parse_publish(buffer: &[u8]) -> Option<(String, Bytes)> {
     Some((topic.to_string(), payload))
 }
 
-/// Serialisiert ein ausgehendes QoS-0-PUBLISH-Frame ohne DUP/RETAIN-Flags.
+/// Serialises an outgoing QoS-0 PUBLISH frame without DUP/RETAIN flags.
 fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
     let topic_bytes = topic.as_bytes();
     let remaining_len = 2 + topic_bytes.len() + payload.len();
@@ -741,14 +739,14 @@ fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Parst die Topic-Filter-Liste aus einem UNSUBSCRIBE-Frame.
-/// Gibt eine leere Liste zurueck wenn das Frame zu kurz oder malformed ist.
+/// Parses the topic filter list from an UNSUBSCRIBE frame.
+/// Returns an empty list if the frame is too short or malformed.
 fn parse_unsubscribe_filters(buffer: &[u8]) -> Vec<String> {
-    // Mindest: fixed header (1) + varint (1) + packet id (2) + min filter (3)
+    // Minimum: fixed header (1) + varint (1) + packet id (2) + min filter (3)
     if buffer.len() < 7 {
         return Vec::new();
     }
-    // Varint ueberspringen
+    // Skip Varint
     let mut offset = 1usize;
     let mut multiplier: usize = 1;
     let mut remaining: usize = 0;
@@ -768,7 +766,7 @@ fn parse_unsubscribe_filters(buffer: &[u8]) -> Vec<String> {
     if body_end > buffer.len() || offset + 2 > body_end {
         return Vec::new();
     }
-    // Packet ID ueberspringen
+    // Skip Packet ID
     offset += 2;
 
     let mut filters = Vec::new();
@@ -786,7 +784,7 @@ fn parse_unsubscribe_filters(buffer: &[u8]) -> Vec<String> {
     filters
 }
 
-/// Schreibt eine MQTT Variable Byte Integer (Remaining Length) ans Ende von `out`.
+/// Writes an MQTT Variable Byte Integer (Remaining Length) to the end of `out`.
 fn encode_remaining_length(mut value: usize, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7F) as u8;

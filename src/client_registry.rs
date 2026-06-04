@@ -1,5 +1,5 @@
-//! ClientRegistry: einzige Wahrheit darueber, welche Clients aktuell verbunden
-//! sind. Kapselt das Takeover-Protokoll bei Client-ID-Kollision (ADR-0004).
+//! ClientRegistry: single source of truth about which clients are currently
+//! connected. Encapsulates the takeover protocol on Client ID collision (ADR-0004).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -7,33 +7,32 @@ use std::sync::Mutex;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-/// Nachricht an einen Connection Task ueber dessen mpsc-Channel.
+/// Message to a Connection Task via its mpsc channel.
 #[derive(Debug, Clone)]
 pub enum ConnectionCommand {
-    /// Vorgerendertes PUBLISH-Frame vom Router-Fanout.
+    /// Pre-rendered PUBLISH frame from the router fanout.
     DeliverFrame(Bytes),
-    /// Serverseitiges Beenden (z.B. Takeover bei Client-ID-Kollision).
+    /// Server-initiated termination (e.g. takeover on Client ID collision).
     Disconnect,
 }
 
-/// Registry der aktuell verbundenen Clients.
+/// Registry of currently connected clients.
 ///
-/// Trennt sich vom `TopicRouter`, weil ein Client auch ohne Subscriptions
-/// verbunden sein kann.
+/// Kept separate from `TopicRouter` because a client can be connected
+/// without having any subscriptions.
 #[derive(Default)]
 pub struct ClientRegistry {
     inner: Mutex<HashMap<String, mpsc::Sender<ConnectionCommand>>>,
 }
 
 impl ClientRegistry {
-    /// Erzeugt eine leere Registry.
+    /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Atomisches Insert-or-Replace. Gibt den vorher unter `client_id`
-    /// eingetragenen Sender zurueck (falls vorhanden), damit der Caller die
-    /// alte Session kicken kann.
+    /// Atomic insert-or-replace. Returns the sender previously stored under
+    /// `client_id` (if any) so that the caller can kick the old session.
     pub fn swap_in(
         &self,
         client_id: &str,
@@ -43,11 +42,11 @@ impl ClientRegistry {
         map.insert(client_id.to_string(), new_tx)
     }
 
-    /// Entfernt den Eintrag fuer `client_id` (idempotent).
+    /// Removes the entry for `client_id` (idempotent).
     ///
-    /// Wichtig: entfernt nur, wenn der gespeicherte Sender mit dem uebergebenen
-    /// `own_tx` identisch ist. Das verhindert, dass ein verdraengter alter Task
-    /// beim Aufraeumen den frisch eingetragenen Nachfolger ausloescht.
+    /// Important: only removes if the stored sender is identical to the
+    /// provided `own_tx`. This prevents a displaced old task from deleting
+    /// the freshly registered successor during cleanup.
     pub fn remove_if_owner(&self, client_id: &str, own_tx: &mpsc::Sender<ConnectionCommand>) {
         let mut map = self.inner.lock().expect("registry mutex poisoned");
         if let Some(stored) = map.get(client_id)

@@ -5,8 +5,8 @@ mod config_tests {
 
     #[test]
     fn test_defaults_when_no_config_file_exists() {
-        // Arbeitsverzeichnis auf ein temporaeres Verzeichnis setzen,
-        // in dem keine rusty-mqtt.toml liegt
+        // Set working directory to a temporary directory
+        // that contains no rusty-mqtt.toml
         let tmp = env::temp_dir().join("rusty_mqtt_test_no_config");
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -38,7 +38,7 @@ mod config_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(
             tmp.join("rusty-mqtt.toml"),
-            "das ist %%% kein gueltiges TOML {{{\n",
+            "this is %%% not valid TOML {{{\n",
         )
         .unwrap();
 
@@ -86,19 +86,19 @@ mod config_tests {
 
         let mut server = MqttServer::from_config(config);
 
-        // Server im Hintergrund starten
+        // Start server in the background
         let handle = tokio::spawn(async move {
             let _ = server.run().await;
         });
 
-        // Kurz warten bis der Server bereit ist
+        // Wait briefly until the server is ready
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Verbindung auf dem konfigurierten Port muss funktionieren
+        // Connection on the configured port must succeed
         let result = TcpStream::connect("127.0.0.1:18840").await;
         assert!(
             result.is_ok(),
-            "Server sollte auf konfiguriertem Port horchen"
+            "Server should be listening on the configured port"
         );
 
         handle.abort();

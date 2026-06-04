@@ -1,19 +1,19 @@
-# mpsc-Fanout für PUBLISH-Zustellung
+# mpsc Fanout for PUBLISH Delivery
 
-Jeder Connection Task besitzt seinen `TcpStream` exklusiv. Damit ein PUBLISH-empfangender Task Nachrichten an die Sockets anderer Subscriber zustellen kann, registriert jeder Connection Task beim CONNECT einen `mpsc::Sender<Bytes>` als Teil seines `Subscriber`-Eintrags im `TopicRouter`. Der Connection Task `select!`-ed in seiner Hauptschleife zwischen `socket.read()` und `rx.recv()` und schreibt eingehende Frames auf seinen Socket.
+Each Connection Task owns its `TcpStream` exclusively. To allow a PUBLISH-receiving task to deliver messages to the sockets of other subscribers, each Connection Task registers an `mpsc::Sender<Bytes>` as part of its `Subscriber` entry in the `TopicRouter` on CONNECT. The Connection Task `select!`s in its main loop between `socket.read()` and `rx.recv()` and writes incoming frames to its socket.
 
-Channels sind **bounded** (Kapazität tbd, Größenordnung 64). Publishing erfolgt mit `try_send`: ist der Channel voll, wird die Nachricht **verworfen**, der Publisher wird nicht gebremst.
+Channels are **bounded** (capacity tbd, order of magnitude 64). Publishing uses `try_send`: if the channel is full the message is **dropped** and the publisher is not blocked.
 
 ## Considered Options
 
-- **mpsc-Fanout (gewählt)** — idiomatisches Tokio, keine Lock-Contention im Hot-Path, Backpressure pro Subscriber lokal.
-- **`Arc<Mutex<HashMap<ClientId, OwnedWriteHalf>>>`** — globaler Mutex bei jedem Publish; verstößt gegen das Tokio-Idiom „prefer message passing over shared state" aus AGENT.md.
-- **`broadcast`-Channel pro Topic** — passt nicht zum Wildcard-Modell; das Routing-Match findet pro PUBLISH einmalig statt, nicht pro Subscription.
-- **Unbounded mpsc** — einfacher, aber unbeschränktes RAM-Wachstum bei langsamen Subscribern, kein natürliches Loss-Verhalten.
+- **mpsc fanout (chosen)** — idiomatic Tokio, no lock contention in the hot path, backpressure per subscriber is local.
+- **`Arc<Mutex<HashMap<ClientId, OwnedWriteHalf>>>`** — global mutex on every publish; violates the Tokio idiom "prefer message passing over shared state" from AGENT.md.
+- **`broadcast` channel per topic** — does not fit the wildcard model; the routing match happens once per PUBLISH, not per subscription.
+- **Unbounded mpsc** — simpler, but unbounded RAM growth for slow subscribers and no natural loss behaviour.
 
 ## Consequences
 
-- Verworfene Nachrichten sind für QoS 0 spec-konform („at most once"), für QoS 1/2 später **nicht** — Re-Design nötig, sobald höhere QoS unterstützt wird.
-- `Subscriber` ist nicht mehr `Clone + PartialEq` ohne weiteres (Channel-Sender ist clonebar, aber semantisch heikel) — Tests im Router müssen darauf achten.
-- `remove_client` muss weiterhin alle Subscriptions des Clients löschen; der Sender wird durch Drop des `rx` im Connection Task ohnehin obsolet.
-- Channel-Kapazität ist ein Tuning-Knopf, der später konfigurierbar gemacht werden kann.
+- Dropped messages are spec-compliant for QoS 0 ("at most once"), but **not** for QoS 1/2 later — a re-design will be needed once higher QoS is supported.
+- `Subscriber` is no longer trivially `Clone + PartialEq` (the channel sender is cloneable but semantically tricky) — router tests must account for this.
+- `remove_client` must continue to remove all subscriptions of the client; the sender becomes obsolete anyway when `rx` is dropped in the Connection Task.
+- Channel capacity is a tuning knob that can be made configurable later.

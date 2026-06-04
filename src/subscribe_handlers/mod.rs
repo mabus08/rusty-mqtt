@@ -1,15 +1,15 @@
-//! Subscribe-Handler: SUBACK-Generierung und Wildcard-Matching-Hilfsfunktionen.
+//! Subscribe handler: SUBACK generation and wildcard-matching helpers.
 pub mod storage;
 pub use storage::{Subscriber, TopicRouter, topic_matches};
 
-/// Interne Aufzeichnung einer Subscription (Paket-ID, QoS, Filter).
+/// Internal record of a subscription (Packet ID, QoS, filter).
 #[derive(Debug, Clone)]
 pub struct SubscriptionRecord {
-    /// Packet Identifier des urspruenglichen SUBSCRIBE-Pakets.
+    /// Packet Identifier of the original SUBSCRIBE packet.
     pub packet_id: u16,
-    /// Gewuenschter QoS-Level.
+    /// Requested QoS level.
     pub qos: u8,
-    /// Topic Filter String.
+    /// Topic Filter string.
     pub topic_filter: String,
 }
 
@@ -25,7 +25,7 @@ impl Default for SubscribeHandler {
 }
 
 impl SubscribeHandler {
-    /// Erstellt einen neuen `SubscribeHandler`.
+    /// Creates a new `SubscribeHandler`.
     pub fn new() -> Self {
         let subs = Vec::new();
         Self {
@@ -43,7 +43,7 @@ impl SubscribeHandler {
     }
 
     /// Generates SUBACK response per MQTT v3.1.1 spec.
-    /// `granted_qos` enthaelt die tatsaechlich gewährten QoS-Werte (je 1 Byte pro Subscription).
+    /// `granted_qos` contains the actually granted QoS values (1 byte per subscription).
     pub fn generate_suback(packet_id: u16, granted_qos: &[u8]) -> Vec<u8> {
         let mut response = vec![
             0x90,
@@ -55,13 +55,13 @@ impl SubscribeHandler {
         response
     }
 
-    /// Topic wildcard matching -- delegiert an die kanonische Implementierung in storage.
+    /// Topic wildcard matching — delegates to the canonical implementation in storage.
     pub fn wildcard_match(filter: &str, topic: &str) -> bool {
         topic_matches(filter, topic)
     }
 }
 
-/// Prueft ob `topic` exakt mit `filter` uebereinstimmt (kein Wildcard-Matching).
+/// Checks whether `topic` exactly matches `filter` (no wildcard matching).
 pub fn exact_match(topic: &str, filter: &str) -> bool {
     topic_matches(topic, filter)
 }

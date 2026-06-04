@@ -1,23 +1,23 @@
-# Framed-Codec und typisierte Fehler
+# Framed Codec and Typed Errors
 
-Der Broker liest und schreibt MQTT-Frames über `tokio_util::codec::Framed` mit einem broker-eigenen `MqttCodec`, der sowohl `Decoder<Item = MqttPacket>` als auch `Encoder<MqttPacket>` implementiert. Der Codec ist die einzige Stelle im Code, an der Wire-Format-Wissen (Varint-Längen, Bit-Layouts, UTF-8-Längen-Prefixe) lebt. Parallel wird ein typisiertes `MqttError`-Enum via `thiserror` eingeführt, das alle Public-API-Signaturen ersetzt, in denen aktuell `Box<dyn Error>` oder `String` als Fehlertyp verwendet werden.
+The broker reads and writes MQTT frames via `tokio_util::codec::Framed` with a broker-owned `MqttCodec` that implements both `Decoder<Item = MqttPacket>` and `Encoder<MqttPacket>`. The codec is the single place in the code where wire-format knowledge lives (Varint lengths, bit layouts, UTF-8 length prefixes). In parallel, a typed `MqttError` enum is introduced via `thiserror`, replacing all public API signatures that currently use `Box<dyn Error>` or `String` as error types.
 
 ## Considered Options
 
-- **`Framed` + Codec (gewählt)** — kanonischer Tokio-Weg, sauber isoliert testbar, Buffer-Management vom Framework, Encoder/Decoder spiegeln sich.
-- **Manueller `BytesMut`-Buffer mit `read_buf`-Schleife** — keine zusätzliche Dependency, aber subtile Fehlerquellen (vergessene `advance`, fragmentierte Frames, gebündelte Frames in einem Read), und Encoder/Decoder müssten getrennt von Hand gebaut werden.
-- **Spezial-Crate wie `mqttbytes`** — würde das Lernziel des Projekts (MQTT selbst implementieren) unterlaufen.
+- **`Framed` + Codec (chosen)** — canonical Tokio approach, cleanly isolated and testable, buffer management by the framework, encoder/decoder are symmetric.
+- **Manual `BytesMut` buffer with `read_buf` loop** — no additional dependency, but subtle pitfalls (forgotten `advance`, fragmented frames, bundled frames in one read), and encoder/decoder would have to be built separately by hand.
+- **Specialised crate such as `mqttbytes`** — would undermine the learning goal of the project (implementing MQTT from scratch).
 
-Für die Fehlerbehandlung:
+For error handling:
 
-- **`thiserror` mit `MqttError`-Enum (gewählt)** — AGENT.md §2 fordert es für Lib-Code; ergibt sich aus dem Decoder-Trait, das einen typisierten Error braucht; macht aufrufende Logik mustermatchbar.
-- **`anyhow::Error`** — bequem, verwischt aber Fehlerkategorien an der API-Grenze und ist laut AGENT.md für Applikationen, nicht für die Lib gedacht.
-- **`Box<dyn Error>` + `String`** — Status quo; keine Strukturinformation, kein Pattern-Matching, keine `From`-Impls.
+- **`thiserror` with `MqttError` enum (chosen)** — AGENT.md §2 requires it for library code; it follows from the Decoder trait needing a typed error; makes calling logic pattern-matchable.
+- **`anyhow::Error`** — convenient, but blurs error categories at the API boundary and is intended for applications, not libraries, per AGENT.md.
+- **`Box<dyn Error>` + `String`** — status quo; no structural information, no pattern-matching, no `From` impls.
 
 ## Consequences
 
-- Neue Dependency `tokio-util` mit Feature `codec` — klein, gehört zum Tokio-Ökosystem, kein Drittanbieter-Risiko.
-- `parse_packet` (lib.rs:310), `parse_connect_client_id` (lib.rs:280), `handle_subscribe_impl` (lib.rs:229) und `generate_suback` (subscribe_handlers/mod.rs:41) ziehen schrittweise in `MqttCodec` um; die alten Funktionen verschwinden oder werden zu thin wrappers.
-- `MqttServer::run` und `handle_connection` bekommen `Result<(), MqttError>` als Signatur. `main.rs` darf weiterhin `anyhow`/`Box<dyn Error>` verwenden, weil es Application-Code ist.
-- Der Connection Task wird ein `tokio::select!` zwischen `framed.next()` (eingehende Frames) und `rx.recv()` (auszusendende Bytes vom Router) — der „ein read = ein Paket"-Bug des Stack-Buffer-Loops verschwindet automatisch.
-- `MqttError`-Varianten werden bei Bedarf inkrementell ergänzt; ein vorab vollständig spezifiziertes Enum lohnt sich nicht, weil sich die Varianten erst beim Decoder-Schreiben herauskristallisieren.
+- New dependency `tokio-util` with feature `codec` — small, part of the Tokio ecosystem, no third-party risk.
+- `parse_packet` (lib.rs:310), `parse_connect_client_id` (lib.rs:280), `handle_subscribe_impl` (lib.rs:229) and `generate_suback` (subscribe_handlers/mod.rs:41) migrate incrementally into `MqttCodec`; the old functions disappear or become thin wrappers.
+- `MqttServer::run` and `handle_connection` get `Result<(), MqttError>` as their signature. `main.rs` may continue to use `anyhow`/`Box<dyn Error>` because it is application code.
+- The Connection Task becomes a `tokio::select!` between `framed.next()` (incoming frames) and `rx.recv()` (bytes to send from the router) — the "one read = one packet" bug of the current stack-buffer loop disappears automatically.
+- `MqttError` variants are added incrementally as needed; specifying the full enum upfront is not worthwhile because the variants only crystallise during decoder development.

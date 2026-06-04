@@ -1,27 +1,27 @@
-# ClientRegistry und Takeover-Protokoll bei Client-ID-Kollision
+# ClientRegistry and Takeover Protocol on Client ID Collision
 
-Eine `ClientRegistry` (`HashMap<ClientId, mpsc::Sender<ConnectionCommand>>`) wird neben dem `TopicRouter` gehalten und ist die einzige Wahrheit darüber, welche Clients aktuell verbunden sind. Der mpsc-Channel zum Connection Task trägt das Enum `ConnectionCommand` mit zwei Varianten: `DeliverFrame(Bytes)` (vom Router weitergeleitete PUBLISH-Bytes, vgl. ADR-0002) und `Disconnect` (serverseitig angeordnetes Beenden).
+A `ClientRegistry` (`HashMap<ClientId, mpsc::Sender<ConnectionCommand>>`) is maintained alongside the `TopicRouter` and is the single source of truth about which clients are currently connected. The mpsc channel to the Connection Task carries the `ConnectionCommand` enum with two variants: `DeliverFrame(Bytes)` (PUBLISH bytes forwarded by the router, see ADR-0002) and `Disconnect` (server-initiated termination).
 
-Tritt ein zweiter CONNECT mit derselben Client ID ein, **muss** laut MQTT 3.1.1 §3.1.4 die bestehende Verbindung beendet werden. Das geschieht synchron im Kontext des **neuen** Connection Task **bevor** dieser sich selbst in Registry oder Router einträgt:
+When a second CONNECT arrives with the same Client ID, **per MQTT 3.1.1 §3.1.4** the existing connection must be terminated. This happens synchronously in the context of the **new** Connection Task **before** it registers itself in the registry or router:
 
 1. `let old = registry.swap_in(client_id, new_tx)`
-2. Falls vorhanden: `old.send(ConnectionCommand::Disconnect).await; old.closed().await;`
-3. (Erst jetzt) eigene Subscriptions im `TopicRouter` registrieren
+2. If present: `old.send(ConnectionCommand::Disconnect).await; old.closed().await;`
+3. (Only then) register own subscriptions in the `TopicRouter`
 
-Schritt 2 wartet auf das Schließen des alten Channels — was passiert, sobald der alte Connection Task seinen `select!`-Loop verlässt und seinen Receiver fallen lässt. Damit ist garantiert, dass der alte Task seinen `router.remove_client`-Cleanup beendet hat, bevor der neue Task irgendetwas in den Router einträgt.
+Step 2 waits for the old channel to close — which happens as soon as the old Connection Task exits its `select!` loop and drops its receiver. This guarantees that the old task has completed its `router.remove_client` cleanup before the new task writes anything to the router.
 
 ## Considered Options
 
-- **Erweiterter Command-Channel + synchroner Kick mit `closed().await` (gewählt)** — eine Synchronisations-Primitive pro Client, einheitlicher Cleanup-Pfad für „kicked", „self-DISCONNECT", „TCP error" und „read timeout", deterministische Eliminierung der Takeover-Race.
-- **Separater `oneshot::Sender<()>` als Kick-Handle** — zweites Primitive, Edge Cases wenn der oneshot bereits durch Self-Disconnect konsumiert wurde, kein gemeinsamer Code-Pfad mit dem regulären Frame-Empfang.
-- **`tokio::task::JoinHandle::abort()`** — reißt den alten Task mitten im `.await` ab, überspringt damit den `remove_client`-Cleanup; hinterlässt dangling Subscriptions im Router. Verworfen.
-- **Eine kombinierte Struktur** statt zweier Registries — würde TopicRouter-Einträge für Clients ohne Subscriptions erzwingen oder einen Sonderfall „verbunden, aber keine Subscriptions" mitführen. Bricht die Glossardefinition „TopicRouter = wer hört zu".
-- **Kick-and-forget + Epoch-Counter pro Client** — vermeidet das `closed().await`, fügt aber pro Frame eine Epoch-Validierung hinzu und macht den Cleanup-Pfad nicht-lokal. Mehr Code, weniger Determinismus.
+- **Extended command channel + synchronous kick with `closed().await` (chosen)** — one synchronisation primitive per client, unified cleanup path for "kicked", "self-DISCONNECT", "TCP error" and "read timeout", deterministic elimination of the takeover race.
+- **Separate `oneshot::Sender<()>` as kick handle** — second primitive, edge cases when the oneshot has already been consumed by a self-disconnect, no shared code path with regular frame reception.
+- **`tokio::task::JoinHandle::abort()`** — tears down the old task mid-`.await`, skipping the `remove_client` cleanup; leaves dangling subscriptions in the router. Rejected.
+- **A combined structure** instead of two registries — would force TopicRouter entries for clients without subscriptions, or add a "connected but no subscriptions" special case. Breaks the glossary definition "TopicRouter = who is listening".
+- **Kick-and-forget + epoch counter per client** — avoids `closed().await`, but adds an epoch validation per frame and makes the cleanup path non-local. More code, less determinism.
 
 ## Consequences
 
-- `MqttServer` hält zwei `Arc`s: `Arc<Mutex<TopicRouter>>` und `Arc<ClientRegistry>` (`ClientRegistry` kapselt seinen Mutex selbst). Beide werden an jeden Connection Task übergeben.
-- Der Connection Task ist die einzige Stelle, die `router.remove_client(&self.client_id)` und `registry.remove(&self.client_id)` aufruft — niemals von außen. Damit gibt es genau einen Cleanup-Pfad.
-- `mpsc::Sender::closed()` ist Teil der stabilen Tokio-API; kein nightly, kein Workaround.
-- Der Kick-Pfad serialisiert: der neue CONNECT antwortet erst mit CONNACK, nachdem der alte Task vollständig beendet ist. Im Pathologie-Fall (alter Task hängt in einem `await`) dauert das. Für den MVP akzeptabel; falls relevant, wäre `tokio::time::timeout` um Schritt 2 die nächste Eskalationsstufe.
-- Vor dem CONNECT (also bevor `client_id` bekannt ist) hat der Connection Task **keinen** Registry-Eintrag und **keinen** mpsc-Channel. Der Channel wird im CONNECT-Handler erzeugt, nicht in `accept()`.
+- `MqttServer` holds two `Arc`s: `Arc<Mutex<TopicRouter>>` and `Arc<ClientRegistry>` (`ClientRegistry` encapsulates its own mutex). Both are passed to each Connection Task.
+- The Connection Task is the only place that calls `router.remove_client(&self.client_id)` and `registry.remove(&self.client_id)` — never from outside. This gives exactly one cleanup path.
+- `mpsc::Sender::closed()` is part of the stable Tokio API; no nightly, no workaround.
+- The kick path serialises: the new CONNECT only responds with CONNACK after the old task has fully terminated. In the pathological case (old task stuck in an `await`) this may take time. Acceptable for the MVP; if relevant, `tokio::time::timeout` around step 2 would be the next escalation.
+- Before CONNECT (i.e. before `client_id` is known) the Connection Task has **no** registry entry and **no** mpsc channel. The channel is created in the CONNECT handler, not in `accept()`.

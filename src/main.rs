@@ -14,9 +14,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config_path = config_dir.join("rusty-mqtt.toml");
 
     if config_path.exists() {
-        info!(path = %config_path.display(), "Konfiguration geladen");
+        info!(path = %config_path.display(), "Configuration loaded");
     } else {
-        info!("Keine Konfigurationsdatei gefunden, verwende Defaults");
+        info!("No configuration file found, using defaults");
     }
 
     let config = BrokerConfig::load_from(&config_dir)?;

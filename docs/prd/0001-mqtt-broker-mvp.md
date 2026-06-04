@@ -1,174 +1,174 @@
 # PRD 0001 — MQTT 3.1.1 Broker MVP: End-to-End Pub/Sub
 
 **Status:** ready-for-agent
-**Glossar:** [`CONTEXT.md`](../../CONTEXT.md)
-**Architektur:** [`docs/adr/0002`](../adr/0002-mpsc-fanout-fuer-publish-zustellung.md), [`0003`](../adr/0003-framed-codec-und-typisierte-fehler.md), [`0004`](../adr/0004-clientregistry-und-takeover-protokoll.md)
+**Glossary:** [`CONTEXT.md`](../../CONTEXT.md)
+**Architecture:** [`docs/adr/0002`](../adr/0002-mpsc-fanout-fuer-publish-zustellung.md), [`0003`](../adr/0003-framed-codec-und-typisierte-fehler.md), [`0004`](../adr/0004-clientregistry-und-takeover-protokoll.md)
 **Roadmap:** [`TODO.md`](../../TODO.md)
 
 ## Problem Statement
 
-Als MQTT-Client-Entwickler kann ich mich derzeit zwar mit dem Broker verbinden, SUBSCRIBE-Pakete absenden und PING-Roundtrips fahren — ich kann aber **keine Nachrichten zwischen zwei Clients austauschen**. Ein PUBLISH wird vom Broker still verschluckt, kein Subscriber empfängt jemals etwas. Damit ist der Broker für seinen eigentlichen Zweck unbrauchbar.
+As an MQTT client developer I can currently connect to the broker, send SUBSCRIBE packets and perform PING roundtrips — but I **cannot exchange messages between two clients**. A PUBLISH is silently swallowed by the broker and no subscriber ever receives anything. This makes the broker useless for its actual purpose.
 
-Zusätzlich gibt es mehrere stille Spec-Verletzungen, die in realen Setups zu schwer diagnostizierbaren Fehlern führen: der Keep-Alive-Wert aus dem CONNECT wird ignoriert (tote Clients hängen minutenlang als verbunden), zwei parallele CONNECTs mit derselben Client ID werden beide angenommen (anstatt die alte Verbindung zu beenden), und SUBACK granted QoS-Werte, die der Broker faktisch nicht liefert.
+In addition there are several silent spec violations that lead to hard-to-diagnose failures in real setups: the Keep-Alive value from CONNECT is ignored (dead clients hang as connected for minutes), two parallel CONNECTs with the same Client ID are both accepted (instead of terminating the old connection), and SUBACK granted QoS values do not reflect what the broker actually delivers.
 
 ## Solution
 
-Der Broker wird zum vollwertigen MQTT-3.1.1-MVP für QoS 0 ausgebaut. Ein PUBLISH eines Clients wird an alle Subscriber, deren Topic Filter (inkl. `+`/`#`-Wildcards) auf das Topic matchen, zugestellt. Keep-Alive aus dem CONNECT wird respektiert, Client-ID-Kollisionen führen zum spec-konformen Takeover, und SUBACK reflektiert ehrlich, was der Broker liefern kann.
+The broker is extended to a fully functional MQTT 3.1.1 MVP for QoS 0. A PUBLISH from one client is delivered to all subscribers whose topic filters (including `+`/`#` wildcards) match the topic. Keep-Alive from CONNECT is respected, Client ID collisions result in a spec-compliant takeover, and SUBACK honestly reflects what the broker can deliver.
 
-Konkret kann der Nutzer am Ende mit zwei `mosquitto`-Clients eine vollständige Pub/Sub-Session fahren: ein `mosquitto_sub -t 'home/+/temp'` empfängt jede `mosquitto_pub -t 'home/kitchen/temp' -m '21.5'`-Nachricht, idle Clients werden nach Ablauf ihres Keep-Alive-Intervalls geräumt, und ein zweiter Connect mit demselben `--id` killt die erste Session sauber.
+Concretely, at the end the user can run a complete pub/sub session with two `mosquitto` clients: a `mosquitto_sub -t 'home/+/temp'` receives every `mosquitto_pub -t 'home/kitchen/temp' -m '21.5'` message, idle clients are cleaned up after their Keep-Alive interval expires, and a second connect with the same `--id` cleanly kills the first session.
 
 ## User Stories
 
-1. Als IoT-Entwickler möchte ich ein PUBLISH mit konkretem Topic an den Broker senden, sodass alle Subscriber mit passendem Topic Filter die Nachricht empfangen.
-2. Als IoT-Entwickler möchte ich beim SUBSCRIBE einen Topic Filter mit `+`-Wildcard angeben, sodass ich exakt ein Topic-Level frei lassen kann (z. B. `home/+/temp`).
-3. Als IoT-Entwickler möchte ich beim SUBSCRIBE einen Topic Filter mit terminalem `#` angeben, sodass ich beliebig viele Subtopics auf einmal abonniere (z. B. `sensors/#`).
-4. Als IoT-Entwickler möchte ich Payloads beliebiger Größe (innerhalb der Varint-Grenze) versenden, sodass auch JSON-Sensordaten von einigen KB sauber durchgereicht werden.
-5. Als IoT-Entwickler möchte ich, dass mein Subscriber binäre Payloads byte-genau erhält, sodass ich keine Encoding-Verluste habe.
-6. Als IoT-Entwickler möchte ich, dass ein PUBLISH mit Wildcards im Topic vom Broker abgelehnt wird, sodass die Spec-Garantien für Topic-Namen erhalten bleiben.
-7. Als IoT-Entwickler möchte ich, dass mein PUBLISH mit QoS > 0 vorerst stillschweigend verworfen wird (mit Log-Warnung), sodass der Broker stabil bleibt, bis QoS 1/2 unterstützt wird.
-8. Als IoT-Entwickler möchte ich ein SUBSCRIBE mit angefordertem QoS 1 oder 2 absenden können und ein SUBACK mit granted QoS 0 erhalten, sodass meine Client-Library spec-konform downgraden kann.
-9. Als IoT-Entwickler möchte ich, dass mehrere Subscriber gleichzeitig auf dasselbe Topic abonniert sind und alle die Nachricht erhalten, sodass Fan-Out funktioniert.
-10. Als IoT-Entwickler möchte ich, dass ich ein UNSUBSCRIBE absetzen kann und danach für diese Filter keine PUBLISH-Nachrichten mehr erhalte, sodass mein Client gezielt Topics abbestellen kann.
-11. Als IoT-Entwickler möchte ich, dass auf mein UNSUBSCRIBE ein UNSUBACK mit derselben Packet ID zurückkommt, sodass meine Client-Library die Quittung zuordnen kann.
-12. Als IoT-Entwickler möchte ich, dass mein Client beim CONNECT einen Keep-Alive-Wert übermittelt und der Broker mich erst nach 1,5× dieses Intervalls als tot betrachtet, sodass ich die Heartbeat-Frequenz selbst bestimmen kann.
-13. Als IoT-Entwickler möchte ich, dass ein PINGREQ innerhalb des Keep-Alive-Intervalls den Read-Timer beim Broker zurücksetzt, sodass mein langlebiger Subscriber online bleibt.
-14. Als IoT-Entwickler möchte ich, dass jeder beliebige Control Packet (nicht nur PINGREQ) den Keep-Alive-Timer resettet, sodass aktive Publisher nicht zusätzlich pingen müssen.
-15. Als IoT-Entwickler möchte ich `keep_alive=0` setzen können, sodass mein Client ohne Heartbeat-Pflicht arbeiten kann.
-16. Als IoT-Entwickler möchte ich, dass ein zweiter CONNECT mit derselben Client ID die alte Verbindung sauber beendet, bevor er CONNACK auf die neue Verbindung schickt, sodass es nie zwei aktive Sessions mit derselben ID gibt.
-17. Als IoT-Entwickler möchte ich, dass beim Takeover die Subscriptions der alten Session vollständig geräumt sind, bevor die neue Session ihre eigenen registriert, sodass kein Cleanup-Race meine neuen Subscriptions versehentlich löscht.
-18. Als IoT-Entwickler möchte ich, dass mein CONNECT mit falschem Protocol Name vom Broker ohne CONNACK abgelehnt wird, sodass mein Client schnell erkennt, dass er nicht mit MQTT 3.1.1 spricht.
-19. Als IoT-Entwickler möchte ich, dass ein CONNECT mit Protocol Level ≠ 4 ein CONNACK mit Return Code 0x01 (Unacceptable Protocol Version) erhält und die Verbindung danach geschlossen wird, sodass mein Client eine eindeutige Diagnose hat.
-20. Als IoT-Entwickler möchte ich, dass ein CONNECT mit leerer Client ID mit CONNACK Return Code 0x02 (Identifier Rejected) abgelehnt wird, sodass anonyme Connects nicht stillschweigend funktionieren.
-21. Als IoT-Entwickler möchte ich, dass ein CONNECT mit gesetztem Reserved-Bit verworfen wird, sodass Spec-Violationen früh sichtbar werden.
-22. Als IoT-Entwickler möchte ich, dass mein DISCONNECT vom Broker als regulärer Abschluss behandelt wird (kein Error-Log), sodass meine Test-Suiten saubere Outputs haben.
-23. Als IoT-Entwickler möchte ich, dass nach einem DISCONNECT oder Read-Timeout sowohl die ClientRegistry- als auch alle TopicRouter-Einträge meines Clients entfernt werden, sodass ich nach Reconnect keinen Ghost-State erbe.
-24. Als IoT-Entwickler möchte ich, dass mein Clean-Session-Flag im CONNECT gelesen und SessionPresent im CONNACK konsistent auf 0 gesetzt wird, sodass mein Client weiß, dass keine Session resumed wird.
-25. Als Broker-Betreiber möchte ich, dass alle Connection-Lifecycle-Events (Connect, Subscribe, Publish, Disconnect, Kick) via `tracing` strukturiert geloggt werden, sodass ich Probleme nachvollziehen kann.
-26. Als Broker-Betreiber möchte ich, dass `println!` nirgends mehr im Library-Code verwendet wird, sodass Logging einheitlich konfigurierbar ist.
-27. Als Broker-Betreiber möchte ich, dass langsame Subscriber ihre eigenen Frames verlieren statt den Publisher zu blockieren, sodass ein einzelner kaputter Client den Broker nicht lahmlegt.
-28. Als Broker-Betreiber möchte ich konfigurieren können, mit welchem Host/Port der Broker bindet (via TOML, wie bereits in ADR-0001 entschieden), sodass ich Deployment-Umgebungen unterscheiden kann.
-29. Als Rust-Entwickler am Projekt möchte ich, dass Public-API-Fehler typisiert via `MqttError` zurückgegeben werden, sodass aufrufende Code-Stellen Fehlerfälle pattern-matchen können.
-30. Als Rust-Entwickler am Projekt möchte ich, dass der Codec isoliert von Tokio testbar ist, sodass Wire-Format-Bugs in Sekunden-Tests gefunden werden statt in End-to-End-Setups.
-31. Als Rust-Entwickler am Projekt möchte ich, dass der TCP-Read-Loop nicht mehr ein Paket pro `read()`-Aufruf annimmt, sodass fragmentierte oder gebündelte Frames spec-konform behandelt werden.
-32. Als Rust-Entwickler am Projekt möchte ich, dass alle `pub`-Items dokumentiert sind (`///`), sodass die generierte rustdoc-Dokumentation vollständig ist.
-33. Als Rust-Entwickler am Projekt möchte ich, dass `cargo clippy --all-targets -- -D warnings` ohne Warnings durchläuft, sodass die Definition-of-Done aus AGENT.md erfüllt ist.
+1. As an IoT developer I want to send a PUBLISH with a concrete topic to the broker so that all subscribers with a matching topic filter receive the message.
+2. As an IoT developer I want to specify a topic filter with a `+` wildcard in SUBSCRIBE so that I can leave exactly one topic level free (e.g. `home/+/temp`).
+3. As an IoT developer I want to specify a topic filter with a terminal `#` in SUBSCRIBE so that I can subscribe to any number of subtopics at once (e.g. `sensors/#`).
+4. As an IoT developer I want to send payloads of arbitrary size (within the Varint limit) so that JSON sensor data of a few KB is forwarded cleanly.
+5. As an IoT developer I want my subscriber to receive binary payloads byte-for-byte so that I have no encoding losses.
+6. As an IoT developer I want a PUBLISH with wildcards in the topic to be rejected by the broker so that the spec guarantees for topic names are preserved.
+7. As an IoT developer I want my PUBLISH with QoS > 0 to be silently dropped for now (with a log warning) so that the broker remains stable until QoS 1/2 is supported.
+8. As an IoT developer I want to be able to send a SUBSCRIBE with requested QoS 1 or 2 and receive a SUBACK with granted QoS 0 so that my client library can downgrade in a spec-compliant way.
+9. As an IoT developer I want multiple subscribers to be subscribed to the same topic simultaneously and all receive the message so that fan-out works.
+10. As an IoT developer I want to be able to send an UNSUBSCRIBE and afterwards receive no more PUBLISH messages for those filters so that my client can unsubscribe from topics selectively.
+11. As an IoT developer I want my UNSUBSCRIBE to be acknowledged with an UNSUBACK carrying the same Packet ID so that my client library can match the acknowledgement.
+12. As an IoT developer I want my client to transmit a Keep-Alive value in CONNECT and for the broker to consider me dead only after 1.5× that interval so that I can determine the heartbeat frequency myself.
+13. As an IoT developer I want a PINGREQ within the Keep-Alive interval to reset the read timer at the broker so that my long-lived subscriber stays online.
+14. As an IoT developer I want any control packet (not just PINGREQ) to reset the Keep-Alive timer so that active publishers do not need to send additional pings.
+15. As an IoT developer I want to be able to set `keep_alive=0` so that my client can work without a heartbeat obligation.
+16. As an IoT developer I want a second CONNECT with the same Client ID to cleanly terminate the old connection before sending CONNACK on the new connection so that there are never two active sessions with the same ID.
+17. As an IoT developer I want the subscriptions of the old session to be fully cleaned up before the new session registers its own so that no cleanup race accidentally deletes my new subscriptions.
+18. As an IoT developer I want my CONNECT with a wrong Protocol Name to be rejected by the broker without CONNACK so that my client quickly recognises it is not speaking MQTT 3.1.1.
+19. As an IoT developer I want a CONNECT with Protocol Level ≠ 4 to receive a CONNACK with Return Code 0x01 (Unacceptable Protocol Version) and for the connection to be closed afterwards so that my client has a clear diagnostic.
+20. As an IoT developer I want a CONNECT with an empty Client ID to be rejected with CONNACK Return Code 0x02 (Identifier Rejected) so that anonymous connects do not silently succeed.
+21. As an IoT developer I want a CONNECT with the Reserved Bit set to be discarded so that spec violations are visible early.
+22. As an IoT developer I want my DISCONNECT to be treated by the broker as a regular conclusion (no error log) so that my test suites have clean outputs.
+23. As an IoT developer I want both the ClientRegistry and all TopicRouter entries for my client to be removed after a DISCONNECT or read timeout so that I do not inherit ghost state after reconnecting.
+24. As an IoT developer I want my Clean-Session flag in CONNECT to be read and SessionPresent in CONNACK to be consistently set to 0 so that my client knows no session is being resumed.
+25. As a broker operator I want all connection lifecycle events (Connect, Subscribe, Publish, Disconnect, Kick) to be logged in structured form via `tracing` so that I can trace problems.
+26. As a broker operator I want `println!` to be used nowhere in library code so that logging is uniformly configurable.
+27. As a broker operator I want slow subscribers to lose their own frames rather than blocking the publisher so that a single broken client cannot bring down the broker.
+28. As a broker operator I want to be able to configure the host/port the broker binds to (via TOML, as already decided in ADR-0001) so that I can distinguish deployment environments.
+29. As a Rust developer on the project I want public API errors to be returned in a typed form via `MqttError` so that calling code can pattern-match on error cases.
+30. As a Rust developer on the project I want the codec to be testable in isolation from Tokio so that wire-format bugs are found in second-level tests rather than in end-to-end setups.
+31. As a Rust developer on the project I want the TCP read loop to no longer assume one packet per `read()` call so that fragmented or bundled frames are handled in a spec-compliant way.
+32. As a Rust developer on the project I want all `pub` items to be documented (`///`) so that the generated rustdoc documentation is complete.
+33. As a Rust developer on the project I want `cargo clippy --all-targets -- -D warnings` to pass without warnings so that the Definition of Done from AGENT.md is satisfied.
 
 ## Implementation Decisions
 
-### Module
+### Modules
 
-- **`codec`** (neu, deep) — `MqttCodec` implementiert `tokio_util::codec::{Decoder, Encoder}`. Einzige Stelle, an der Wire-Format-Wissen lebt (Fixed-Header-Bits, Varint-Längen, UTF-8-Prefixe, Connect-Validierung). `Decoder::Item = MqttPacket`. Pure Logik auf `BytesMut`, keine Tokio-Socket-Abhängigkeit.
-- **`topic_router`** (existiert, modifiziert) — Subscriber-Typ wird um `tx: mpsc::Sender<ConnectionCommand>` erweitert, Feld `qos` wird zu `granted_qos` umbenannt, neue Methode `unsubscribe(client_id, &[topic_filter])` ergänzt `remove_client` (das weiterhin alle Subscriptions löscht). Wildcard-Matching bleibt wie ist.
-- **`client_registry`** (neu, deep) — `HashMap<ClientId, mpsc::Sender<ConnectionCommand>>` hinter `Mutex`. Methoden: `swap_in(client_id, tx) → Option<old_tx>` (atomisches Insert-or-Replace, gibt den verdrängten Sender zurück), `remove(client_id)`. Kapselt die Race-kritische Takeover-Policy.
-- **`error`** (neu) — `MqttError`-Enum via `thiserror`. Ersetzt schrittweise alle `Box<dyn Error>` und `String`-Errors in der Public-API. Varianten wachsen organisch (`Io`, `MalformedFrame`, `UnsupportedQos`, `PublishTopicHasWildcards`, …).
-- **`connection_task`** (existiert als private fn, wird sauber modularisiert) — Orchestriert den per-Client-Loop: `Framed`-basierter `select!` über drei Arme (eingehende Frames, ausgehende `ConnectionCommand`s aus dem mpsc, Keep-Alive-Sleep). Inhärent Tokio-gekoppelt, daher Integrationstest-Subjekt.
-- **`server`** (existiert, vereinfacht) — `MqttServer`-Accept-Loop, hält `Arc<Mutex<TopicRouter>>` und `Arc<ClientRegistry>`, reicht beide pro Verbindung an `connection_task` durch.
-- **`config`** (existiert, unverändert) — `BrokerConfig` aus TOML, bereits getestet.
+- **`codec`** (new, deep) — `MqttCodec` implements `tokio_util::codec::{Decoder, Encoder}`. Single place where wire-format knowledge lives (Fixed Header bits, Varint lengths, UTF-8 prefixes, Connect validation). `Decoder::Item = MqttPacket`. Pure logic on `BytesMut`, no Tokio socket dependency.
+- **`topic_router`** (existing, modified) — Subscriber type is extended with `tx: mpsc::Sender<ConnectionCommand>`, field `qos` renamed to `granted_qos`, new method `unsubscribe(client_id, &[topic_filter])` supplements `remove_client` (which continues to remove all subscriptions). Wildcard matching stays as-is.
+- **`client_registry`** (new, deep) — `HashMap<ClientId, mpsc::Sender<ConnectionCommand>>` behind `Mutex`. Methods: `swap_in(client_id, tx) → Option<old_tx>` (atomic insert-or-replace, returns the displaced sender), `remove(client_id)`. Encapsulates the race-critical takeover policy.
+- **`error`** (new) — `MqttError` enum via `thiserror`. Incrementally replaces all `Box<dyn Error>` and `String` errors in the public API. Variants grow organically (`Io`, `MalformedFrame`, `UnsupportedQos`, `PublishTopicHasWildcards`, …).
+- **`connection_task`** (existing as private fn, cleanly modularised) — orchestrates the per-client loop: `Framed`-based `select!` over three arms (incoming frames, outgoing `ConnectionCommand`s from the mpsc, Keep-Alive sleep). Inherently Tokio-coupled, therefore an integration-test subject.
+- **`server`** (existing, simplified) — `MqttServer` accept loop, holds `Arc<Mutex<TopicRouter>>` and `Arc<ClientRegistry>`, passes both to `connection_task` per connection.
+- **`config`** (existing, unchanged) — `BrokerConfig` from TOML, already tested.
 
-### Datentypen
+### Data Types
 
-- **`MqttPacket`** — ein einziges Enum für Inbound und Outbound (vgl. Grilling-Entscheidung g1), strukturierte Varianten mit benannten Feldern. PUBLISH-Variante: `{ topic: String, payload: Bytes, qos: u8 }`. Encoder hat `unreachable!()`-Arme für Inbound-Only-Varianten — dokumentiert die Asymmetrie ohne zwei separate Enums zu erzwingen.
-- **`ConnectionCommand`** — Enum mit zwei Varianten: `DeliverFrame(Bytes)` (vorgerenderte PUBLISH-Frames vom Router-Fanout) und `Disconnect` (serverseitiges Beenden bei Client-ID-Kollision).
+- **`MqttPacket`** — a single enum for inbound and outbound (cf. grilling decision g1), structured variants with named fields. PUBLISH variant: `{ topic: String, payload: Bytes, qos: u8 }`. Encoder has `unreachable!()` arms for inbound-only variants — documents the asymmetry without forcing two separate enums.
+- **`ConnectionCommand`** — enum with two variants: `DeliverFrame(Bytes)` (pre-rendered PUBLISH frames from the router fanout) and `Disconnect` (server-initiated termination on Client ID collision).
 - **`Subscriber`** — `{ client_id: String, granted_qos: u8, tx: mpsc::Sender<ConnectionCommand> }`.
 
-### Konstanten
+### Constants
 
-- `MAX_SUPPORTED_QOS: u8 = 0` — physische Code-Capability, nicht Konfiguration. Wird hochgesetzt, wenn QoS 1/2 implementiert wird.
-- `SUBSCRIBER_CHANNEL_CAPACITY: usize = 32` — pro Connection. Bei Vollheit `try_send` → drop, kein Backpressure auf den Publisher.
+- `MAX_SUPPORTED_QOS: u8 = 0` — physical code capability, not configuration. Raised when QoS 1/2 is implemented.
+- `SUBSCRIBER_CHANNEL_CAPACITY: usize = 32` — per connection. On full: `try_send` → drop, no backpressure on the publisher.
 
-### Verhaltens-Entscheidungen
+### Behaviour Decisions
 
-- **PUBLISH-Routing**: Fanout per `Bytes::clone()` (Refcount-Kopie, billig). Der Connection Task, der den eingehenden PUBLISH dekodiert, ist verantwortlich für die Serialisierung des outbound PUBLISH-Frames und das `try_send` an jeden gematchten Subscriber. Drop-on-Full ist QoS-0-konform („at most once").
-- **PUBLISH-Validierung**: Wildcards (`+`/`#`) im Topic-Namen werden verworfen + geloggt (spec §4.7.1.1: Topic Names dürfen keine Wildcards enthalten). QoS > 0 wird verworfen + geloggt. DUP-Bit wird ignoriert. RETAIN-Bit wird ignoriert (Retained Messages out-of-scope).
-- **CONNECT-Validierung**: Protocol Name ≠ `"MQTT"` → Frame als malformed verwerfen, Socket schließen ohne CONNACK. Protocol Level ≠ 4 → CONNACK mit Return Code 0x01 senden, danach Socket schließen. Reserved Bit ≠ 0 → malformed. Client ID leer → CONNACK 0x02, dann schließen.
-- **CONNACK-Format**: SessionPresent immer 0 (keine Session-Persistenz im MVP). Return Code 0x00 bei Erfolg.
-- **SUBACK-Granted-QoS**: `granted = min(requested, MAX_SUPPORTED_QOS)` pro Topic Filter (silent downgrade). Failure-Code 0x80 wird im MVP nicht verwendet.
-- **Keep-Alive**: Read-Deadline = 1.5 × `keep_alive` aus CONNECT. `keep_alive == 0` → kein Read-Timeout. Implementierung als dritter `select!`-Arm mit `tokio::time::Sleep`, dessen Deadline bei jedem empfangenen Frame via `as_mut().reset(...)` neu gesetzt wird (saubere Symmetrie der Arme).
-- **Client-ID-Takeover**: Der **neue** Connection Task ist verantwortlich für den Kick — synchron, **bevor** er sich selbst in TopicRouter einträgt:
+- **PUBLISH routing**: fanout via `Bytes::clone()` (ref-count copy, cheap). The Connection Task decoding the incoming PUBLISH is responsible for serialising the outbound PUBLISH frame and `try_send`-ing to each matched subscriber. Drop-on-full is QoS-0-compliant ("at most once").
+- **PUBLISH validation**: wildcards (`+`/`#`) in the topic name are dropped + logged (spec §4.7.1.1: topic names must not contain wildcards). QoS > 0 is dropped + logged. DUP bit is ignored. RETAIN bit is ignored (Retained Messages out of scope).
+- **CONNECT validation**: Protocol Name ≠ `"MQTT"` → discard frame as malformed, close socket without CONNACK. Protocol Level ≠ 4 → send CONNACK with Return Code 0x01, then close socket. Reserved Bit ≠ 0 → malformed. Client ID empty → CONNACK 0x02, then close.
+- **CONNACK format**: SessionPresent always 0 (no session persistence in MVP). Return Code 0x00 on success.
+- **SUBACK granted QoS**: `granted = min(requested, MAX_SUPPORTED_QOS)` per topic filter (silent downgrade). Failure code 0x80 is not used in MVP.
+- **Keep-Alive**: read deadline = 1.5 × `keep_alive` from CONNECT. `keep_alive == 0` → no read timeout. Implemented as a third `select!` arm with `tokio::time::Sleep`, whose deadline is reset on every received frame via `as_mut().reset(...)` (clean arm symmetry).
+- **Client ID takeover**: the **new** Connection Task is responsible for the kick — synchronously, **before** it registers itself in the TopicRouter:
   1. `let old = registry.swap_in(client_id, new_tx)`
-  2. Falls `old.is_some()`: `old.send(ConnectionCommand::Disconnect).await; old.closed().await;`
-  3. CONNACK senden
-  4. Eigene Subscriptions im Router registrieren (passiert ohnehin erst beim SUBSCRIBE)
+  2. If `old.is_some()`: `old.send(ConnectionCommand::Disconnect).await; old.closed().await;`
+  3. Send CONNACK
+  4. Register own subscriptions in the router (happens only on SUBSCRIBE anyway)
 
-  Das `closed().await` garantiert, dass der alte Task seinen `router.remove_client`-Cleanup beendet hat, bevor der neue Task fortfährt — damit ist die Takeover-Race deterministisch eliminiert.
-- **Cleanup-Pfad**: Genau eine Stelle — das Ende der `connection_task`-Funktion — ruft `router.remove_client` + `registry.remove`. Greift einheitlich für DISCONNECT, Read-Timeout, TCP-Error, Takeover-Kick.
-- **Clean-Session-Flag**: gelesen, geloggt, sonst ignoriert. SessionPresent im CONNACK bleibt 0 — spec-konform, da der Broker keine Sessions persistiert.
-- **Stream-Framing**: Wird durch `Framed` strukturell gelöst — der „ein read() = ein Paket"-Bug des aktuellen Stack-Buffer-Loops verschwindet ohne expliziten Fix.
+  The `closed().await` guarantees that the old task has completed its `router.remove_client` cleanup before the new task proceeds — the takeover race is deterministically eliminated.
+- **Cleanup path**: exactly one place — the end of the `connection_task` function — calls `router.remove_client` + `registry.remove`. Applies uniformly for DISCONNECT, read timeout, TCP error, and takeover kick.
+- **Clean-Session flag**: read, logged, otherwise ignored. SessionPresent in CONNACK stays 0 — spec-compliant since the broker persists no sessions.
+- **Stream framing**: structurally solved by `Framed` — the "one read() = one packet" bug of the current stack-buffer loop disappears without an explicit fix.
 
-### Dependencies (neu)
+### Dependencies (new)
 
 - `tokio-util = { version = "0.7", features = ["codec"] }`
 - `thiserror = "1"`
 - `tracing = "0.1"`
 - `tracing-subscriber = { version = "0.3", features = ["env-filter"] }`
 
-`bytes` ist bereits indirekt verfügbar (Cargo.lock) und wird explizit als Direct-Dep deklariert.
+`bytes` is already available indirectly (Cargo.lock) and is declared explicitly as a direct dependency.
 
-### Architektur-Verweise
+### Architecture References
 
-- ADR-0002 — mpsc-Fanout, bounded, drop-on-full
-- ADR-0003 — Framed-Codec, `thiserror`/`MqttError`
-- ADR-0004 — ClientRegistry, Takeover-Protokoll mit `closed().await`
+- ADR-0002 — mpsc fanout, bounded, drop-on-full
+- ADR-0003 — Framed codec, `thiserror`/`MqttError`
+- ADR-0004 — ClientRegistry, takeover protocol with `closed().await`
 
 ## Testing Decisions
 
-### Test-Philosophie
+### Test Philosophy
 
-Tests beschreiben **beobachtbares Verhalten**, nicht Implementierungsdetails. Konkret:
+Tests describe **observable behaviour**, not implementation details. Specifically:
 
-- Codec-Tests prüfen Byte-Layouts (Input → Output), nicht interne Hilfsfunktionen.
-- Router-Tests prüfen, was `get_subscribers_for_topic` zurückgibt — nicht, wie die HashMap intern strukturiert ist.
-- Registry-Tests prüfen die Semantik von `swap_in` (was kommt zurück, was steht danach drin) — nicht, ob ein Mutex verwendet wird.
-- Integrationstests fahren echte TCP-Sessions und prüfen, dass Bytes zwischen zwei Sockets fließen — nicht, welche Tokio-Tasks gespawnt werden.
+- Codec tests check byte layouts (input → output), not internal helper functions.
+- Router tests check what `get_subscribers_for_topic` returns — not how the HashMap is structured internally.
+- Registry tests check the semantics of `swap_in` (what comes back, what is stored afterwards) — not whether a Mutex is used.
+- Integration tests run real TCP sessions and check that bytes flow between two sockets — not which Tokio tasks are spawned.
 
-### Zu testende Module
+### Modules to Test
 
-- **`codec`** (höchste Test-Dichte):
-  - Decoder-Happy-Path pro Pakettyp: CONNECT, PUBLISH (mit/ohne Payload, mit/ohne Varint-Multibyte), SUBSCRIBE (mit mehreren Filtern), UNSUBSCRIBE, PINGREQ, DISCONNECT.
-  - Decoder-Malformed-Cases: zu kurzer Buffer, Varint-Overflow (5. Byte), falscher Protocol Name, Protocol Level ≠ 4, Reserved Bit gesetzt, leere Client ID, Wildcards in PUBLISH-Topic, QoS > 2.
-  - Decoder-Incomplete-Cases: halber Frame → `Ok(None)` (Decoder fragt nach mehr Bytes).
-  - Encoder-Happy-Path pro Outbound-Pakettyp: CONNACK (mit verschiedenen Return Codes), PUBLISH, SUBACK, UNSUBACK, PINGRESP.
-  - Round-Trip-Tests: `encode(p) then decode == p` für PUBLISH (das einzige bidirektionale Paket mit nicht-trivialer Struktur).
-- **`topic_router`** (existierende 9 Tests erhalten, ergänzt um):
-  - `unsubscribe` entfernt einzelnen Filter, lässt andere stehen.
-  - `unsubscribe` auf nicht-existenten Filter ist no-op (kein Error).
-  - `subscribe` mit Channel-tx: `get_subscribers_for_topic` liefert den richtigen tx zurück; `try_send` über diesen tx erreicht einen Mock-Receiver.
+- **`codec`** (highest test density):
+  - Decoder happy path per packet type: CONNECT, PUBLISH (with/without payload, with/without multi-byte Varint), SUBSCRIBE (with multiple filters), UNSUBSCRIBE, PINGREQ, DISCONNECT.
+  - Decoder malformed cases: buffer too short, Varint overflow (5th byte), wrong Protocol Name, Protocol Level ≠ 4, Reserved Bit set, empty Client ID, wildcards in PUBLISH topic, QoS > 2.
+  - Decoder incomplete cases: half frame → `Ok(None)` (Decoder asks for more bytes).
+  - Encoder happy path per outbound packet type: CONNACK (with various Return Codes), PUBLISH, SUBACK, UNSUBACK, PINGRESP.
+  - Round-trip tests: `encode(p) then decode == p` for PUBLISH (the only bidirectional packet with non-trivial structure).
+- **`topic_router`** (existing 9 tests retained, supplemented by):
+  - `unsubscribe` removes a single filter, leaves others intact.
+  - `unsubscribe` on a non-existent filter is a no-op (no error).
+  - `subscribe` with channel tx: `get_subscribers_for_topic` returns the correct tx; `try_send` via that tx reaches a mock receiver.
 - **`client_registry`**:
-  - `swap_in` auf leeren Slot → `None`.
-  - `swap_in` mit existierendem Eintrag → alter Sender als `Some` zurück, neuer Sender ist danach gespeichert.
-  - `remove` löscht; danach `swap_in` → `None`.
-- **`connection_task`** (End-to-End-Integrationstests in `tests/`):
-  - Zwei TCP-Clients: einer subt `home/+/temp`, anderer pubt `home/kitchen/temp` mit Payload — Subscriber empfängt die Bytes.
-  - Mehrere Subscriber auf demselben Topic — alle empfangen.
-  - Subscriber abonniert mit `#` — empfängt Nachrichten auf beliebiger Topic-Tiefe.
-  - Client-ID-Kollision: zweiter CONNECT mit gleicher ID → erster Client erhält TCP-Close, zweiter Client erhält CONNACK 0x00.
-  - Keep-Alive-Timeout: Client mit `keep_alive=1` und kein Traffic für > 1.5s → Broker schließt die Verbindung.
-  - DISCONNECT: regulärer Abschluss, kein Error-Log, Subscriptions geräumt.
+  - `swap_in` on empty slot → `None`.
+  - `swap_in` with existing entry → old sender as `Some`, new sender stored afterwards.
+  - `remove` deletes; afterwards `swap_in` → `None`.
+- **`connection_task`** (end-to-end integration tests in `tests/`):
+  - Two TCP clients: one subscribes to `home/+/temp`, the other publishes to `home/kitchen/temp` with payload — subscriber receives the bytes.
+  - Multiple subscribers on the same topic — all receive.
+  - Subscriber subscribes with `#` — receives messages at any topic depth.
+  - Client ID collision: second CONNECT with same ID → first client receives TCP close, second client receives CONNACK 0x00.
+  - Keep-Alive timeout: client with `keep_alive=1` and no traffic for > 1.5s → broker closes the connection.
+  - DISCONNECT: regular conclusion, no error log, subscriptions cleaned up.
 
-### Prior Art im Repo
+### Prior Art in the Repo
 
-- `tests/integration_subscribe.rs` — Byte-Level-Tests von SUBSCRIBE/SUBACK-Frames, Vorlage für Codec-Encoder-Tests.
-- `tests/integration_tests.rs` — Wildcard-Matching-Tests, ergänzt durch Router-Tests im neuen Stil.
-- `tests/connection_test.rs` — echte TCP-Roundtrips mit `TcpStream`, Vorlage für die End-to-End-Tests.
-- `src/subscribe_handlers/storage.rs` Modul-Tests (`#[cfg(test)] mod tests`) — Inline-Unit-Tests als Konvention, wird für `codec`, `client_registry`, `error` übernommen.
+- `tests/integration_subscribe.rs` — byte-level tests of SUBSCRIBE/SUBACK frames, template for codec encoder tests.
+- `tests/integration_tests.rs` — wildcard matching tests, supplemented by router tests in the new style.
+- `tests/connection_test.rs` — real TCP roundtrips with `TcpStream`, template for end-to-end tests.
+- `src/subscribe_handlers/storage.rs` module tests (`#[cfg(test)] mod tests`) — inline unit tests as convention, adopted for `codec`, `client_registry`, `error`.
 
 ## Out of Scope
 
-- **Retained Messages** — explizit verworfen in TODO.md, keine separate Datenstruktur, RETAIN-Bit wird ignoriert.
-- **Last Will / Will-Message** — CONNECT-Flag wird gelesen, Payload nicht geparst, keine Will-Speicherung.
-- **QoS 1 und 2** — `MAX_SUPPORTED_QOS = 0`, PUBACK/PUBREC/PUBREL/PUBCOMP nicht implementiert, eingehende PUBLISH mit QoS > 0 werden verworfen.
-- **Persistente Sessions** — Clean-Session-Flag wird gelesen aber ignoriert, SessionPresent bleibt immer 0.
-- **Authentifizierung** — Username/Password-Felder aus den Connect-Flags werden nicht geparst, nicht geprüft.
-- **CLI-Args** (`--port`, `--host`, `--verbose`) — Konfiguration bleibt rein TOML-basiert (ADR-0001).
-- **Max-Connections-Limit, Max-Payload-Size, Graceful Shutdown** — Polish-Phase.
-- **Observability-Topics** (`/stats`, `/broker`, Throughput-Metriken) — Polish-Phase.
-- **Keep-Alive-Safety-Net** für `keep_alive=0` (Broker-Maximalwert als DoS-Schutz) — TODO für später.
-- **UUID-Generierung für leere Client IDs** — leere Client ID wird im MVP abgelehnt, nicht ersetzt.
+- **Retained Messages** — explicitly out of scope in TODO.md, no separate data structure, RETAIN bit is ignored.
+- **Last Will / Will-Message** — CONNECT flag is read, payload not parsed, no Will storage.
+- **QoS 1 and 2** — `MAX_SUPPORTED_QOS = 0`, PUBACK/PUBREC/PUBREL/PUBCOMP not implemented, incoming PUBLISH with QoS > 0 are dropped.
+- **Persistent Sessions** — Clean-Session flag is read but ignored, SessionPresent is always 0.
+- **Authentication** — Username/Password fields from Connect flags are not parsed and not checked.
+- **CLI args** (`--port`, `--host`, `--verbose`) — configuration remains purely TOML-based (ADR-0001).
+- **Max-connections limit, max-payload size, graceful shutdown** — polish phase.
+- **Observability topics** (`/stats`, `/broker`, throughput metrics) — polish phase.
+- **Keep-Alive safety-net** for `keep_alive=0` (broker maximum as DoS protection) — TODO for later.
+- **UUID generation for empty Client IDs** — empty Client ID is rejected in MVP, not replaced.
 
 ## Further Notes
 
-- Die Roadmap in `TODO.md` ist in vier Phasen geschnitten (Foundation, Connection Lifecycle, PUBLISH-Routing, Cleanup) und kann phasenweise abgearbeitet werden. Phase 1 ist überwiegend mechanisch (Dep-Adds, Error-Refactor, Tracing-Migration); Phase 2 und 3 enthalten die eigentliche neue Logik; Phase 4 ist Definition-of-Done.
-- Die Verifikationspipeline aus AGENT.md §4 (`cargo fmt --check && cargo check --all-targets && cargo clippy --all-targets -- -D warnings && cargo test`) muss am Ende grün sein. Die aktuellen 13 Tests müssen erhalten bleiben (gegebenenfalls angepasst an die neue `MqttPacket`-Form).
-- `unsafe` ist projektweit verboten (AGENT.md §2.4); keine Stelle dieses PRDs erfordert es.
-- Alle neuen `pub` Items brauchen `///`-Doc-Comments (AGENT.md §5).
-- Der Codec ist absichtlich so geschnitten, dass eine spätere Migration auf eine MQTT-5-Variante (Property-Maps, Reason Codes) durch Hinzufügen neuer Enum-Varianten möglich bleibt, ohne den Rest des Codes anzufassen.
+- The roadmap in `TODO.md` is split into four phases (Foundation, Connection Lifecycle, PUBLISH Routing, Cleanup) and can be worked through phase by phase. Phase 1 is largely mechanical (dependency additions, error refactor, tracing migration); phases 2 and 3 contain the actual new logic; phase 4 is the Definition of Done.
+- The verification pipeline from AGENT.md §4 (`cargo fmt --check && cargo check --all-targets && cargo clippy --all-targets -- -D warnings && cargo test`) must be green at the end. The existing 13 tests must be preserved (adjusted as needed to the new `MqttPacket` form).
+- `unsafe` is forbidden project-wide (AGENT.md §2.4); no part of this PRD requires it.
+- All new `pub` items need `///` doc-comments (AGENT.md §5).
+- The codec is deliberately structured so that a later migration to an MQTT 5 variant (property maps, reason codes) is possible by adding new enum variants without touching the rest of the code.

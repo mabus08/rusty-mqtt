@@ -4,22 +4,22 @@ use tokio::sync::mpsc;
 
 use crate::client_registry::ConnectionCommand;
 
-/// Ein einzelner Subscriber fuer ein Topic.
+/// A single subscriber for a topic.
 ///
-/// Haelt zusaetzlich einen `mpsc::Sender`, ueber den vom Router gefannt
-/// PUBLISH-Frames an den zustaendigen Connection Task gepusht werden.
+/// Also holds an `mpsc::Sender` through which pre-rendered PUBLISH frames
+/// are pushed by the router fanout to the responsible Connection Task.
 #[derive(Debug, Clone)]
 pub struct Subscriber {
-    /// Client-ID des Subscribers.
+    /// Client ID of the subscriber.
     pub client_id: String,
-    /// Vom Broker gewaehrter QoS-Wert (`granted_qos`).
+    /// QoS value granted by the broker (`granted_qos`).
     pub qos: u8,
-    /// Channel-Sender zum Connection Task; vorgerenderte Frames gehen hier rein.
+    /// Channel sender to the Connection Task; pre-rendered frames go here.
     pub tx: mpsc::Sender<ConnectionCommand>,
 }
 
-/// Globaler Topic Router: speichert Subscriptions nach Topic Filter.
-/// Key = Topic Filter String, Value = Liste der Subscriber.
+/// Global topic router: stores subscriptions by topic filter.
+/// Key = Topic Filter string, Value = list of subscribers.
 pub struct TopicRouter {
     subscriptions: HashMap<String, Vec<Subscriber>>,
 }
@@ -37,9 +37,9 @@ impl TopicRouter {
         }
     }
 
-    /// Registriert Subscriptions fuer einen Client.
-    /// Bei Duplikaten (gleiche client_id + gleicher Topic Filter) wird der QoS aktualisiert (Replace-Semantik).
-    /// Gibt die granted QoS-Werte zurueck (in der Reihenfolge der uebergebenen Filter).
+    /// Registers subscriptions for a client.
+    /// On duplicates (same client_id + same topic filter) the QoS is updated (replace semantics).
+    /// Returns the granted QoS values (in the order of the provided filters).
     pub fn subscribe(
         &mut self,
         client_id: &str,
@@ -51,7 +51,7 @@ impl TopicRouter {
         for (topic_filter, qos) in filters {
             let subscribers = self.subscriptions.entry(topic_filter.clone()).or_default();
 
-            // Replace-Semantik: existierenden Eintrag fuer gleiche client_id aktualisieren
+            // Replace semantics: update existing entry for the same client_id
             if let Some(existing) = subscribers.iter_mut().find(|s| s.client_id == client_id) {
                 existing.qos = *qos;
                 existing.tx = tx.clone();
@@ -69,7 +69,7 @@ impl TopicRouter {
         granted_qos
     }
 
-    /// Gibt alle Subscriber zurueck, deren Topic Filter auf das gegebene Topic matchen.
+    /// Returns all subscribers whose topic filter matches the given topic.
     pub fn get_subscribers_for_topic(&self, topic: &str) -> Vec<&Subscriber> {
         let mut result = Vec::new();
 
@@ -82,8 +82,8 @@ impl TopicRouter {
         result
     }
 
-    /// Entfernt Subscriptions eines Clients fuer die angegebenen Topic Filter.
-    /// Nicht vorhandene Filter werden still ignoriert (no-op).
+    /// Removes subscriptions of a client for the specified topic filters.
+    /// Filters that are not present are silently ignored (no-op).
     pub fn unsubscribe(&mut self, client_id: &str, filters: &[String]) {
         for filter in filters {
             if let Some(subs) = self.subscriptions.get_mut(filter) {
@@ -93,21 +93,21 @@ impl TopicRouter {
         self.subscriptions.retain(|_, subs| !subs.is_empty());
     }
 
-    /// Entfernt alle Subscriptions eines Clients (z.B. bei Disconnect).
+    /// Removes all subscriptions of a client (e.g. on disconnect).
     pub fn remove_client(&mut self, client_id: &str) {
         for subscribers in self.subscriptions.values_mut() {
             subscribers.retain(|s| s.client_id != client_id);
         }
-        // Leere Topic-Eintraege aufraeumen
+        // Clean up empty topic entries
         self.subscriptions.retain(|_, subs| !subs.is_empty());
     }
 }
 
-/// MQTT Topic Wildcard Matching nach MQTT 3.1.1 Spec.
+/// MQTT topic wildcard matching per MQTT 3.1.1 spec.
 ///
-/// - `+` matcht exakt ein Topic-Level (alles zwischen zwei `/`)
-/// - `#` matcht null oder mehr verbleibende Levels (muss am Ende stehen)
-/// - Ohne Wildcards: exakter String-Vergleich
+/// - `+` matches exactly one topic level (everything between two `/`)
+/// - `#` matches zero or more remaining levels (must appear at the end)
+/// - Without wildcards: exact string comparison
 pub fn topic_matches(filter: &str, topic: &str) -> bool {
     if filter == topic {
         return true;
@@ -123,12 +123,12 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
         let f_level = filter_levels[fi];
 
         if f_level == "#" {
-            // # matcht alle verbleibenden Levels (inklusive null)
+            // # matches all remaining levels (including zero)
             return true;
         }
 
         if ti >= topic_levels.len() {
-            // Topic hat weniger Levels als der Filter (ohne #)
+            // Topic has fewer levels than the filter (without #)
             return false;
         }
 
@@ -136,16 +136,16 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
             return false;
         }
 
-        // + matcht genau dieses eine Level, oder es war ein exakter Match
+        // + matches exactly this one level, or it was an exact match
         fi += 1;
         ti += 1;
     }
 
-    // Beide muessen gleichzeitig am Ende sein
+    // Both must be at the end simultaneously
     fi == filter_levels.len() && ti == topic_levels.len()
 }
 
-/// Erstellt einen neuen leeren [`TopicRouter`] (Convenience-Funktion).
+/// Creates a new empty [`TopicRouter`] (convenience function).
 pub fn create_router() -> TopicRouter {
     TopicRouter::new()
 }
