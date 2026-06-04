@@ -82,6 +82,17 @@ impl TopicRouter {
         result
     }
 
+    /// Entfernt Subscriptions eines Clients fuer die angegebenen Topic Filter.
+    /// Nicht vorhandene Filter werden still ignoriert (no-op).
+    pub fn unsubscribe(&mut self, client_id: &str, filters: &[String]) {
+        for filter in filters {
+            if let Some(subs) = self.subscriptions.get_mut(filter) {
+                subs.retain(|s| s.client_id != client_id);
+            }
+        }
+        self.subscriptions.retain(|_, subs| !subs.is_empty());
+    }
+
     /// Entfernt alle Subscriptions eines Clients (z.B. bei Disconnect).
     pub fn remove_client(&mut self, client_id: &str) {
         for subscribers in self.subscriptions.values_mut() {

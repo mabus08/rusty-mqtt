@@ -527,6 +527,225 @@ async fn at16_empty_client_id_returns_connack_identifier_rejected() {
 // AT17 — CONNECT with reserved bit set -> close without CONNACK
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// AT5 — PUBLISH with wildcard in topic name must be discarded
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at5_publish_with_wildcard_topic_is_discarded() {
+    let addr = spawn_broker().await;
+
+    // Subscriber on everything under "x/".
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
+    sub.write_all(&connect_packet("sub-wc")).await.unwrap();
+    expect_connack_ok(&mut sub).await;
+    sub.write_all(&subscribe_packet(1, "x/#", 0)).await.unwrap();
+    expect_suback(&mut sub, 1, &[0x00]).await;
+
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&connect_packet("pub-wc")).await.unwrap();
+    expect_connack_ok(&mut pubc).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // PUBLISH with '+' wildcard in topic name — must be discarded.
+    pubc.write_all(&publish_packet("x/+/bad", b"data"))
+        .await
+        .unwrap();
+    // A legitimate PUBLISH right after — must arrive.
+    pubc.write_all(&publish_packet("x/legit", b"ok"))
+        .await
+        .unwrap();
+
+    // Subscriber must receive exactly the legitimate message, not the wildcard one.
+    let pkt = timeout(Duration::from_secs(2), read_packet(&mut sub))
+        .await
+        .expect("must receive legit PUBLISH");
+    let body = &pkt[2..];
+    let tlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert_eq!(
+        &body[2..2 + tlen],
+        b"x/legit",
+        "only legitimate topic must arrive"
+    );
+    assert_eq!(&body[2 + tlen..], b"ok");
+
+    // No further message should arrive.
+    let mut buf = [0u8; 1];
+    let extra = timeout(Duration::from_millis(200), sub.read(&mut buf)).await;
+    assert!(
+        extra.is_err(),
+        "no extra frames must arrive after wildcard PUBLISH"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AT6 — PUBLISH QoS > 0 is silently discarded; broker stays stable
+// ---------------------------------------------------------------------------
+
+fn publish_packet_qos1(topic: &str, packet_id: u16, payload: &[u8]) -> Vec<u8> {
+    // Fixed header: QoS 1 = 0x32 (0011 0010)
+    let mut body = Vec::new();
+    let t = topic.as_bytes();
+    body.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    body.extend_from_slice(t);
+    body.extend_from_slice(&packet_id.to_be_bytes()); // packet identifier (QoS 1)
+    body.extend_from_slice(payload);
+
+    let mut pkt = vec![0x32];
+    encode_varint(body.len(), &mut pkt);
+    pkt.extend_from_slice(&body);
+    pkt
+}
+
+#[tokio::test]
+async fn at6_publish_qos1_discarded_broker_stays_stable() {
+    let addr = spawn_broker().await;
+
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
+    sub.write_all(&connect_packet("sub-q1")).await.unwrap();
+    expect_connack_ok(&mut sub).await;
+    sub.write_all(&subscribe_packet(1, "q1/test", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut sub, 1, &[0x00]).await;
+
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&connect_packet("pub-q1")).await.unwrap();
+    expect_connack_ok(&mut pubc).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // QoS 1 PUBLISH — must be silently dropped, no PUBACK expected.
+    pubc.write_all(&publish_packet_qos1("q1/test", 42, b"discard-me"))
+        .await
+        .unwrap();
+
+    // Broker must not crash; send a legitimate QoS 0 PUBLISH right after.
+    pubc.write_all(&publish_packet("q1/test", b"alive"))
+        .await
+        .unwrap();
+
+    let pkt = timeout(Duration::from_secs(2), read_packet(&mut sub))
+        .await
+        .expect("broker must stay alive and deliver QoS 0 PUBLISH");
+    let body = &pkt[2..];
+    let tlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert_eq!(&body[2 + tlen..], b"alive");
+}
+
+// ---------------------------------------------------------------------------
+// AT7 — SUBSCRIBE with QoS 1/2 requested -> SUBACK grants QoS 0
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at7_subscribe_qos_downgraded_to_zero_in_suback() {
+    let addr = spawn_broker().await;
+
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    s.write_all(&connect_packet("sub-qd")).await.unwrap();
+    expect_connack_ok(&mut s).await;
+
+    // Subscribe with three filters at QoS 0, 1, 2 — all must be granted as 0.
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u16.to_be_bytes()); // packet id
+    for (filter, qos) in [("a/b", 0u8), ("c/d", 1u8), ("e/f", 2u8)] {
+        let f = filter.as_bytes();
+        body.extend_from_slice(&(f.len() as u16).to_be_bytes());
+        body.extend_from_slice(f);
+        body.push(qos);
+    }
+    let mut pkt = vec![0x82];
+    encode_varint(body.len(), &mut pkt);
+    pkt.extend_from_slice(&body);
+    s.write_all(&pkt).await.unwrap();
+
+    let suback = timeout(Duration::from_secs(2), read_packet(&mut s))
+        .await
+        .expect("SUBACK timeout");
+    assert_eq!(suback[0], 0x90);
+    let sb_body = &suback[2..];
+    let pid = u16::from_be_bytes([sb_body[0], sb_body[1]]);
+    assert_eq!(pid, 1);
+    // Three granted QoS bytes — all must be 0x00 (MAX_SUPPORTED_QOS = 0).
+    assert_eq!(
+        &sb_body[2..],
+        &[0x00, 0x00, 0x00],
+        "all granted QoS must be capped at 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AT8 — UNSUBSCRIBE: broker sends UNSUBACK and stops delivering
+// ---------------------------------------------------------------------------
+
+fn unsubscribe_packet(packet_id: u16, topic_filter: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&packet_id.to_be_bytes());
+    let f = topic_filter.as_bytes();
+    body.extend_from_slice(&(f.len() as u16).to_be_bytes());
+    body.extend_from_slice(f);
+
+    let mut pkt = vec![0xA2]; // UNSUBSCRIBE | reserved 0010
+    encode_varint(body.len(), &mut pkt);
+    pkt.extend_from_slice(&body);
+    pkt
+}
+
+#[tokio::test]
+async fn at8_unsubscribe_receives_unsuback_and_stops_delivery() {
+    let addr = spawn_broker().await;
+
+    let mut sub = TcpStream::connect(&addr).await.unwrap();
+    sub.write_all(&connect_packet("sub-unsub")).await.unwrap();
+    expect_connack_ok(&mut sub).await;
+    sub.write_all(&subscribe_packet(1, "unsub/test", 0))
+        .await
+        .unwrap();
+    expect_suback(&mut sub, 1, &[0x00]).await;
+
+    let mut pubc = TcpStream::connect(&addr).await.unwrap();
+    pubc.write_all(&connect_packet("pub-unsub")).await.unwrap();
+    expect_connack_ok(&mut pubc).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // First publish arrives before unsubscribe.
+    pubc.write_all(&publish_packet("unsub/test", b"before"))
+        .await
+        .unwrap();
+    let pkt = timeout(Duration::from_secs(2), read_packet(&mut sub))
+        .await
+        .expect("first PUBLISH must arrive");
+    let body = &pkt[2..];
+    let tlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert_eq!(&body[2 + tlen..], b"before");
+
+    // Unsubscribe.
+    sub.write_all(&unsubscribe_packet(7, "unsub/test"))
+        .await
+        .unwrap();
+    let unsuback = timeout(Duration::from_secs(2), read_packet(&mut sub))
+        .await
+        .expect("UNSUBACK must arrive");
+    assert_eq!(unsuback[0], 0xB0, "expected UNSUBACK packet type");
+    let ub_body = &unsuback[2..];
+    let pid = u16::from_be_bytes([ub_body[0], ub_body[1]]);
+    assert_eq!(pid, 7, "UNSUBACK packet id must match");
+
+    // Give broker a moment to process the unsubscribe before publishing.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Second publish must NOT reach the subscriber.
+    pubc.write_all(&publish_packet("unsub/test", b"after"))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1];
+    let extra = timeout(Duration::from_millis(300), sub.read(&mut buf)).await;
+    assert!(extra.is_err(), "no frames must arrive after UNSUBSCRIBE");
+}
+
+// ---------------------------------------------------------------------------
+// AT17 — CONNECT with reserved bit set -> close without CONNACK
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 async fn at17_reserved_bit_set_closes_without_connack() {
     let addr = spawn_broker().await;

@@ -108,6 +108,10 @@ impl BrokerConfig {
 /// Capacity des per-Connection mpsc-Channels fuer auszuliefernde Frames.
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 32;
 
+/// Maximaler vom Broker unterstuetzter QoS-Level.
+/// Wird hochgesetzt, sobald QoS 1/2 implementiert ist.
+const MAX_SUPPORTED_QOS: u8 = 0;
+
 #[derive(Debug, PartialEq)]
 pub enum MqttPacket {
     Connect,
@@ -250,6 +254,21 @@ impl MqttServer {
                             writer.write_all(&suback).await?;
                             println!("SUBACK sent for client: {}", cid);
                         }
+                        MqttPacket::Unsubscribe(packet_id) => {
+                            let cid = client_id.as_deref().unwrap_or("unknown");
+                            let filters = parse_unsubscribe_filters(frame);
+                            if let Ok(mut r) = router.lock() {
+                                r.unsubscribe(cid, &filters);
+                            }
+                            // UNSUBACK: fixed header 0xB0, remaining length 2, packet id
+                            let unsuback = [
+                                0xB0,
+                                0x02,
+                                (packet_id >> 8) as u8,
+                                (packet_id & 0xFF) as u8,
+                            ];
+                            writer.write_all(&unsuback).await?;
+                        }
                         MqttPacket::PINGREQ => {
                             let pingresp = [0xD0, 0x00];
                             writer.write_all(&pingresp).await?;
@@ -342,7 +361,11 @@ impl MqttServer {
             let qos = buffer[offset];
             offset += 1;
 
-            topic_filters.push((topic, qos));
+            // QoS auf das Broker-Maximum cappen (silent downgrade per Spec).
+            // MAX_SUPPORTED_QOS == 0 => immer 0 im MVP.
+            #[allow(clippy::unnecessary_min_or_max)]
+            let granted = qos.min(MAX_SUPPORTED_QOS);
+            topic_filters.push((topic, granted));
         }
 
         // Subscriptions im Router speichern und granted QoS erhalten
@@ -404,6 +427,15 @@ impl MqttServer {
                 if buffer.len() > 3 {
                     let packet_id = ((buffer[2] as u16) << 8) | (buffer[3] as u16);
                     MqttPacket::Subscribe(packet_id)
+                } else {
+                    MqttPacket::Unknown
+                }
+            }
+            10 => {
+                // UNSUBSCRIBE — fixed header byte must be 0xA2
+                if buffer.len() > 3 {
+                    let packet_id = ((buffer[2] as u16) << 8) | (buffer[3] as u16);
+                    MqttPacket::Unsubscribe(packet_id)
                 } else {
                     MqttPacket::Unknown
                 }
@@ -619,6 +651,11 @@ fn parse_publish(buffer: &[u8]) -> Option<(String, Bytes)> {
     let topic = std::str::from_utf8(&buffer[offset..offset + topic_len]).ok()?;
     offset += topic_len;
 
+    // MQTT 3.1.1 §4.7.1.1: Topic Names MUST NOT contain wildcards.
+    if topic.contains('+') || topic.contains('#') {
+        return None;
+    }
+
     let payload = Bytes::copy_from_slice(&buffer[offset..body_end]);
     Some((topic.to_string(), payload))
 }
@@ -634,6 +671,51 @@ fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(topic_bytes);
     out.extend_from_slice(payload);
     out
+}
+
+/// Parst die Topic-Filter-Liste aus einem UNSUBSCRIBE-Frame.
+/// Gibt eine leere Liste zurueck wenn das Frame zu kurz oder malformed ist.
+fn parse_unsubscribe_filters(buffer: &[u8]) -> Vec<String> {
+    // Mindest: fixed header (1) + varint (1) + packet id (2) + min filter (3)
+    if buffer.len() < 7 {
+        return Vec::new();
+    }
+    // Varint ueberspringen
+    let mut offset = 1usize;
+    let mut multiplier: usize = 1;
+    let mut remaining: usize = 0;
+    for _ in 0..4 {
+        if offset >= buffer.len() {
+            return Vec::new();
+        }
+        let b = buffer[offset];
+        offset += 1;
+        remaining += (b & 0x7F) as usize * multiplier;
+        if b & 0x80 == 0 {
+            break;
+        }
+        multiplier *= 128;
+    }
+    let body_end = offset + remaining;
+    if body_end > buffer.len() || offset + 2 > body_end {
+        return Vec::new();
+    }
+    // Packet ID ueberspringen
+    offset += 2;
+
+    let mut filters = Vec::new();
+    while offset + 2 <= body_end {
+        let flen = ((buffer[offset] as usize) << 8) | (buffer[offset + 1] as usize);
+        offset += 2;
+        if offset + flen > body_end {
+            break;
+        }
+        if let Ok(f) = std::str::from_utf8(&buffer[offset..offset + flen]) {
+            filters.push(f.to_string());
+        }
+        offset += flen;
+    }
+    filters
 }
 
 /// Schreibt eine MQTT Variable Byte Integer (Remaining Length) ans Ende von `out`.
