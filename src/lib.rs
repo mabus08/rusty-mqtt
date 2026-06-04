@@ -204,20 +204,45 @@ impl MqttServer {
                         let packet_type = MqttServer::parse_packet(frame);
                         match packet_type {
                         MqttPacket::Connect => {
-                            let parsed_client_id = MqttServer::parse_connect_client_id(frame);
-                            println!("Connection from client: {:?}", parsed_client_id);
+                            match validate_connect(frame) {
+                                ConnectValidation::Ok {
+                                    client_id: parsed_client_id,
+                                } => {
+                                    println!("Connection from client: {:?}", parsed_client_id);
 
-                            // Takeover (ADR-0004): vor CONNACK alte Session synchron
-                            // beenden, damit deren Cleanup vor unseren Subscriptions
-                            // laeuft.
-                            if let Some(old) = registry.swap_in(&parsed_client_id, tx.clone()) {
-                                let _ = old.send(ConnectionCommand::Disconnect).await;
-                                old.closed().await;
+                                    // Takeover (ADR-0004): vor CONNACK alte Session synchron
+                                    // beenden, damit deren Cleanup vor unseren Subscriptions
+                                    // laeuft.
+                                    if let Some(old) =
+                                        registry.swap_in(&parsed_client_id, tx.clone())
+                                    {
+                                        let _ = old.send(ConnectionCommand::Disconnect).await;
+                                        old.closed().await;
+                                    }
+                                    client_id = Some(parsed_client_id);
+
+                                    let connack = [0x20, 0x02, 0x00, 0x00];
+                                    writer.write_all(&connack).await?;
+                                }
+                                ConnectValidation::BadProtocolName
+                                | ConnectValidation::ReservedBitSet => {
+                                    // Malformed: Socket schliessen ohne CONNACK.
+                                    should_break = true;
+                                    break;
+                                }
+                                ConnectValidation::BadProtocolLevel => {
+                                    let connack = [0x20, 0x02, 0x00, 0x01];
+                                    writer.write_all(&connack).await?;
+                                    should_break = true;
+                                    break;
+                                }
+                                ConnectValidation::EmptyClientId => {
+                                    let connack = [0x20, 0x02, 0x00, 0x02];
+                                    writer.write_all(&connack).await?;
+                                    should_break = true;
+                                    break;
+                                }
                             }
-                            client_id = Some(parsed_client_id);
-
-                            let connack = [0x20, 0x02, 0x00, 0x00];
-                            writer.write_all(&connack).await?;
                         }
                         MqttPacket::Subscribe(_packet_id) => {
                             let cid = client_id.as_deref().unwrap_or("unknown").to_string();
@@ -406,6 +431,122 @@ impl MqttServer {
 
 pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
     MqttServer::extract_packet_id(buffer, offset)
+}
+
+/// Klassifikation des CONNECT-Pakets nach MQTT-3.1.1-Validierung.
+///
+/// Vier beobachtbare Pfade gemaess Spec / PRD 0001:
+/// - `Ok`        — CONNACK 0x00, Session faehrt fort.
+/// - `BadProtocolName` — Frame als malformed verwerfen, Socket schliessen ohne CONNACK.
+/// - `BadProtocolLevel` — CONNACK mit Return Code 0x01, dann schliessen.
+/// - `ReservedBitSet`  — Frame als malformed verwerfen, Socket schliessen ohne CONNACK.
+/// - `EmptyClientId`   — CONNACK mit Return Code 0x02, dann schliessen.
+#[derive(Debug)]
+pub enum ConnectValidation {
+    /// Gueltiger CONNECT, Client-ID extrahiert.
+    Ok {
+        /// Client-ID aus der Payload.
+        client_id: String,
+    },
+    /// Protocol Name ≠ "MQTT".
+    BadProtocolName,
+    /// Protocol Level ≠ 4 (3.1.1).
+    BadProtocolLevel,
+    /// Reserved-Bit (Bit 0 der Connect Flags) gesetzt.
+    ReservedBitSet,
+    /// Payload-Client-ID-String ist leer.
+    EmptyClientId,
+}
+
+/// Validiert ein CONNECT-Frame und klassifiziert das Ergebnis.
+///
+/// Erwartet das vollstaendige Frame inkl. Fixed Header. Multibyte-Varint
+/// (bis 4 Bytes) wird beruecksichtigt.
+pub fn validate_connect(buffer: &[u8]) -> ConnectValidation {
+    // Mindestlaenge: Fixed Header (>=2) + Variable Header (10) + Client ID Length (2)
+    if buffer.is_empty() || (buffer[0] & 0xF0) != 0x10 {
+        return ConnectValidation::BadProtocolName;
+    }
+
+    // Varint Remaining Length ueberspringen
+    let mut offset = 1usize;
+    let mut multiplier: usize = 1;
+    let mut remaining: usize = 0;
+    for _ in 0..4 {
+        if offset >= buffer.len() {
+            return ConnectValidation::BadProtocolName;
+        }
+        let b = buffer[offset];
+        offset += 1;
+        remaining += (b & 0x7F) as usize * multiplier;
+        if b & 0x80 == 0 {
+            break;
+        }
+        multiplier *= 128;
+    }
+    let body_end = offset + remaining;
+    if body_end > buffer.len() {
+        return ConnectValidation::BadProtocolName;
+    }
+
+    // Protocol Name: 2 bytes length + bytes
+    if offset + 2 > body_end {
+        return ConnectValidation::BadProtocolName;
+    }
+    let name_len = ((buffer[offset] as usize) << 8) | (buffer[offset + 1] as usize);
+    offset += 2;
+    if offset + name_len > body_end {
+        return ConnectValidation::BadProtocolName;
+    }
+    if &buffer[offset..offset + name_len] != b"MQTT" {
+        return ConnectValidation::BadProtocolName;
+    }
+    offset += name_len;
+
+    // Protocol Level (1 byte)
+    if offset >= body_end {
+        return ConnectValidation::BadProtocolName;
+    }
+    let level = buffer[offset];
+    offset += 1;
+    if level != 0x04 {
+        return ConnectValidation::BadProtocolLevel;
+    }
+
+    // Connect Flags (1 byte)
+    if offset >= body_end {
+        return ConnectValidation::BadProtocolName;
+    }
+    let flags = buffer[offset];
+    offset += 1;
+    if flags & 0x01 != 0 {
+        return ConnectValidation::ReservedBitSet;
+    }
+
+    // Keep Alive (2 bytes) ueberspringen
+    if offset + 2 > body_end {
+        return ConnectValidation::BadProtocolName;
+    }
+    offset += 2;
+
+    // Client ID (length-prefixed UTF-8)
+    if offset + 2 > body_end {
+        return ConnectValidation::BadProtocolName;
+    }
+    let cid_len = ((buffer[offset] as usize) << 8) | (buffer[offset + 1] as usize);
+    offset += 2;
+    if cid_len == 0 {
+        return ConnectValidation::EmptyClientId;
+    }
+    if offset + cid_len > body_end {
+        return ConnectValidation::BadProtocolName;
+    }
+    match std::str::from_utf8(&buffer[offset..offset + cid_len]) {
+        Ok(cid) => ConnectValidation::Ok {
+            client_id: cid.to_string(),
+        },
+        Err(_) => ConnectValidation::BadProtocolName,
+    }
 }
 
 /// Bestimmt die Gesamtlaenge eines Frames (Fixed Header + Varint + Remaining Length).

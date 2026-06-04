@@ -415,3 +415,125 @@ async fn at12_second_connect_with_same_client_id_kicks_first() {
     let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
     assert_eq!(&body[2 + topic_len..], b"ok");
 }
+
+// ---------------------------------------------------------------------------
+// CONNECT validation helpers
+// ---------------------------------------------------------------------------
+
+/// Build a CONNECT with overridable protocol name / level / connect flags.
+fn connect_packet_with(
+    protocol_name: &[u8],
+    protocol_level: u8,
+    connect_flags: u8,
+    client_id: &str,
+) -> Vec<u8> {
+    let mut vh = Vec::new();
+    vh.extend_from_slice(&(protocol_name.len() as u16).to_be_bytes());
+    vh.extend_from_slice(protocol_name);
+    vh.push(protocol_level);
+    vh.push(connect_flags);
+    vh.extend_from_slice(&[0x00, 0x00]); // keep alive
+
+    let mut payload = Vec::new();
+    let cid = client_id.as_bytes();
+    payload.extend_from_slice(&(cid.len() as u16).to_be_bytes());
+    payload.extend_from_slice(cid);
+
+    let mut pkt = vec![0x10];
+    encode_varint(vh.len() + payload.len(), &mut pkt);
+    pkt.extend_from_slice(&vh);
+    pkt.extend_from_slice(&payload);
+    pkt
+}
+
+/// Assert the broker closes the socket without sending any bytes back.
+async fn expect_close_without_response(stream: &mut TcpStream) {
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("broker should close socket within 2s")
+        .expect("read after close");
+    assert_eq!(n, 0, "broker must not send any bytes before closing");
+}
+
+/// Read one CONNACK + assert return code; broker should then close.
+async fn expect_connack_then_close(stream: &mut TcpStream, expected_return_code: u8) {
+    let pkt = timeout(Duration::from_secs(2), read_packet(stream))
+        .await
+        .expect("CONNACK timeout");
+    assert_eq!(pkt[0], 0x20, "expected CONNACK packet type");
+    assert_eq!(pkt[1], 0x02);
+    assert_eq!(
+        pkt[3], expected_return_code,
+        "expected CONNACK return code 0x{:02X}",
+        expected_return_code
+    );
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("broker should close after non-zero CONNACK")
+        .expect("read after CONNACK");
+    assert_eq!(
+        n, 0,
+        "broker must close the socket after a non-zero CONNACK return code"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AT14 — CONNECT with wrong protocol name -> socket close, no CONNACK
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at14_wrong_protocol_name_closes_without_connack() {
+    let addr = spawn_broker().await;
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    // Protocol name "XXXX" instead of "MQTT"; level 4, clean session.
+    s.write_all(&connect_packet_with(b"XXXX", 0x04, 0x02, "c1"))
+        .await
+        .unwrap();
+    expect_close_without_response(&mut s).await;
+}
+
+// ---------------------------------------------------------------------------
+// AT15 — CONNECT with wrong protocol level -> CONNACK 0x01, then close
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at15_wrong_protocol_level_returns_connack_unacceptable_version() {
+    let addr = spawn_broker().await;
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    // Protocol level 3 (MQTT 3.1) instead of 4.
+    s.write_all(&connect_packet_with(b"MQTT", 0x03, 0x02, "c1"))
+        .await
+        .unwrap();
+    expect_connack_then_close(&mut s, 0x01).await;
+}
+
+// ---------------------------------------------------------------------------
+// AT16 — CONNECT with empty client id -> CONNACK 0x02, then close
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at16_empty_client_id_returns_connack_identifier_rejected() {
+    let addr = spawn_broker().await;
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    s.write_all(&connect_packet_with(b"MQTT", 0x04, 0x02, ""))
+        .await
+        .unwrap();
+    expect_connack_then_close(&mut s, 0x02).await;
+}
+
+// ---------------------------------------------------------------------------
+// AT17 — CONNECT with reserved bit set -> close without CONNACK
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn at17_reserved_bit_set_closes_without_connack() {
+    let addr = spawn_broker().await;
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    // Connect Flags 0x03: clean session + reserved bit set.
+    s.write_all(&connect_packet_with(b"MQTT", 0x04, 0x03, "c1"))
+        .await
+        .unwrap();
+    expect_close_without_response(&mut s).await;
+}
