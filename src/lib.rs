@@ -178,13 +178,28 @@ impl MqttServer {
         registry: Arc<ClientRegistry>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut reader, mut writer) = socket.into_split();
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0u8; 4096];
         let timeout_duration = Duration::from_secs(300);
         let mut client_id: Option<String> = None;
         let (tx, mut rx) = mpsc::channel::<ConnectionCommand>(SUBSCRIBER_CHANNEL_CAPACITY);
+        // Keep-Alive: 0 bedeutet deaktiviert; ansonsten 1.5 × keep_alive_secs.
+        // keep_alive_millis == 0 => kein Timeout-Arm aktiv.
+        let mut keep_alive_millis: u64 = 0;
+        let mut keep_alive_deadline: Option<tokio::time::Instant> = None;
+        let far_future = tokio::time::Instant::now() + Duration::from_secs(u32::MAX as u64);
 
         loop {
+            // Deadline fuer den Keep-Alive-Arm: liegt sie in der Vergangenheit
+            // oder ist kein Keep-Alive konfiguriert, warten wir auf far_future
+            // (effektiv deaktiviert).
+            let ka_instant = keep_alive_deadline.unwrap_or(far_future);
+
             tokio::select! {
+                _ = tokio::time::sleep_until(ka_instant), if keep_alive_deadline.is_some() => {
+                    // Keep-Alive abgelaufen — Verbindung schliessen.
+                    println!("Client Keep-Alive Timeout");
+                    break;
+                }
                 read_result = timeout(timeout_duration, reader.read(&mut buffer)) => {
                     let bytes_read = match read_result {
                         Ok(Ok(n)) => n,
@@ -194,6 +209,13 @@ impl MqttServer {
                     if bytes_read == 0 {
                         println!("Client disconnected");
                         break;
+                    }
+                    // Jedes eingehende Frame setzt den Keep-Alive-Timer zurueck.
+                    if keep_alive_millis > 0 {
+                        keep_alive_deadline = Some(
+                            tokio::time::Instant::now()
+                                + Duration::from_millis(keep_alive_millis),
+                        );
                     }
                     let mut data = &buffer[..bytes_read];
                     let mut should_break = false;
@@ -211,8 +233,19 @@ impl MqttServer {
                             match validate_connect(frame) {
                                 ConnectValidation::Ok {
                                     client_id: parsed_client_id,
+                                    keep_alive_secs,
                                 } => {
                                     println!("Connection from client: {:?}", parsed_client_id);
+
+                                    // Keep-Alive konfigurieren: Deadline = 1.5 × keep_alive.
+                                    if keep_alive_secs > 0 {
+                                        keep_alive_millis =
+                                            (keep_alive_secs as u64) * 1500;
+                                        keep_alive_deadline = Some(
+                                            tokio::time::Instant::now()
+                                                + Duration::from_millis(keep_alive_millis),
+                                        );
+                                    }
 
                                     // Takeover (ADR-0004): vor CONNACK alte Session synchron
                                     // beenden, damit deren Cleanup vor unseren Subscriptions
@@ -475,10 +508,12 @@ pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
 /// - `EmptyClientId`   — CONNACK mit Return Code 0x02, dann schliessen.
 #[derive(Debug)]
 pub enum ConnectValidation {
-    /// Gueltiger CONNECT, Client-ID extrahiert.
+    /// Gueltiger CONNECT, Client-ID und Keep-Alive extrahiert.
     Ok {
         /// Client-ID aus der Payload.
         client_id: String,
+        /// Keep-Alive-Intervall in Sekunden (0 = deaktiviert).
+        keep_alive_secs: u16,
     },
     /// Protocol Name ≠ "MQTT".
     BadProtocolName,
@@ -555,10 +590,11 @@ pub fn validate_connect(buffer: &[u8]) -> ConnectValidation {
         return ConnectValidation::ReservedBitSet;
     }
 
-    // Keep Alive (2 bytes) ueberspringen
+    // Keep Alive (2 bytes) lesen
     if offset + 2 > body_end {
         return ConnectValidation::BadProtocolName;
     }
+    let keep_alive_secs = ((buffer[offset] as u16) << 8) | (buffer[offset + 1] as u16);
     offset += 2;
 
     // Client ID (length-prefixed UTF-8)
@@ -576,6 +612,7 @@ pub fn validate_connect(buffer: &[u8]) -> ConnectValidation {
     match std::str::from_utf8(&buffer[offset..offset + cid_len]) {
         Ok(cid) => ConnectValidation::Ok {
             client_id: cid.to_string(),
+            keep_alive_secs,
         },
         Err(_) => ConnectValidation::BadProtocolName,
     }

@@ -743,6 +743,94 @@ async fn at8_unsubscribe_receives_unsuback_and_stops_delivery() {
 }
 
 // ---------------------------------------------------------------------------
+// AT9  — Keep-Alive: idle client is disconnected after 1.5 × keep_alive
+// AT10 — Keep-Alive: any control packet resets the timer
+// AT11 — keep_alive=0: no read timeout
+// ---------------------------------------------------------------------------
+
+/// Build a CONNECT with explicit keep_alive (seconds).
+fn connect_packet_ka(client_id: &str, keep_alive_secs: u16) -> Vec<u8> {
+    let mut vh = Vec::new();
+    vh.extend_from_slice(&[0x00, 0x04]);
+    vh.extend_from_slice(b"MQTT");
+    vh.push(0x04);
+    vh.push(0x02); // clean session
+    vh.extend_from_slice(&keep_alive_secs.to_be_bytes());
+
+    let cid = client_id.as_bytes();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(cid.len() as u16).to_be_bytes());
+    payload.extend_from_slice(cid);
+
+    let mut pkt = vec![0x10];
+    encode_varint(vh.len() + payload.len(), &mut pkt);
+    pkt.extend_from_slice(&vh);
+    pkt.extend_from_slice(&payload);
+    pkt
+}
+
+#[tokio::test]
+async fn at9_idle_client_disconnected_after_keep_alive_timeout() {
+    let addr = spawn_broker().await;
+
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    // keep_alive = 1s -> broker must close after ~1.5s of silence
+    s.write_all(&connect_packet_ka("ka-idle", 1)).await.unwrap();
+    expect_connack_ok(&mut s).await;
+
+    // Don't send anything — broker must close the connection.
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(4), s.read(&mut buf))
+        .await
+        .expect("broker must close within 4s (1.5s timeout)")
+        .expect("read");
+    assert_eq!(n, 0, "broker must close the idle connection");
+}
+
+#[tokio::test]
+async fn at10_any_packet_resets_keep_alive_timer() {
+    let addr = spawn_broker().await;
+
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    s.write_all(&connect_packet_ka("ka-ping", 1)).await.unwrap();
+    expect_connack_ok(&mut s).await;
+
+    // Send PINGREQs every 0.8s for ~2.5s total (> 1.5 × 1s keep_alive).
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        s.write_all(&[0xC0, 0x00]).await.unwrap(); // PINGREQ
+        let resp = timeout(Duration::from_secs(1), read_packet(&mut s))
+            .await
+            .expect("PINGRESP must arrive");
+        assert_eq!(resp[0], 0xD0);
+    }
+    // Now go silent; broker must close within 1.5s.
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(4), s.read(&mut buf))
+        .await
+        .expect("broker must close after final keep_alive timeout")
+        .expect("read");
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn at11_keep_alive_zero_means_no_timeout() {
+    let addr = spawn_broker().await;
+
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    s.write_all(&connect_packet_ka("ka-zero", 0)).await.unwrap();
+    expect_connack_ok(&mut s).await;
+
+    // 2s of silence — broker must NOT close the connection.
+    let mut buf = [0u8; 1];
+    let result = timeout(Duration::from_secs(2), s.read(&mut buf)).await;
+    assert!(
+        result.is_err(),
+        "with keep_alive=0 the broker must not close an idle connection"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AT17 — CONNECT with reserved bit set -> close without CONNACK
 // ---------------------------------------------------------------------------
 
