@@ -1,10 +1,15 @@
+//! Subscribe-Handler: SUBACK-Generierung und Wildcard-Matching-Hilfsfunktionen.
 pub mod storage;
 pub use storage::{Subscriber, TopicRouter, topic_matches};
 
+/// Interne Aufzeichnung einer Subscription (Paket-ID, QoS, Filter).
 #[derive(Debug, Clone)]
 pub struct SubscriptionRecord {
+    /// Packet Identifier des urspruenglichen SUBSCRIBE-Pakets.
     pub packet_id: u16,
+    /// Gewuenschter QoS-Level.
     pub qos: u8,
+    /// Topic Filter String.
     pub topic_filter: String,
 }
 
@@ -20,6 +25,7 @@ impl Default for SubscribeHandler {
 }
 
 impl SubscribeHandler {
+    /// Erstellt einen neuen `SubscribeHandler`.
     pub fn new() -> Self {
         let subs = Vec::new();
         Self {
@@ -55,6 +61,7 @@ impl SubscribeHandler {
     }
 }
 
+/// Prueft ob `topic` exakt mit `filter` uebereinstimmt (kein Wildcard-Matching).
 pub fn exact_match(topic: &str, filter: &str) -> bool {
     topic_matches(topic, filter)
 }

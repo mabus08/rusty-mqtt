@@ -1,16 +1,22 @@
 use rusty_mqtt::{BrokerConfig, MqttServer};
 use std::env;
 use std::error::Error;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("rusty_mqtt=info".parse()?))
+        .init();
+
     let config_dir = env::current_dir()?;
     let config_path = config_dir.join("rusty-mqtt.toml");
 
     if config_path.exists() {
-        println!("Konfiguration geladen aus: {}", config_path.display());
+        info!(path = %config_path.display(), "Konfiguration geladen");
     } else {
-        println!("Keine Konfigurationsdatei gefunden, verwende Defaults");
+        info!("Keine Konfigurationsdatei gefunden, verwende Defaults");
     }
 
     let config = BrokerConfig::load_from(&config_dir)?;

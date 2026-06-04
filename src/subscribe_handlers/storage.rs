@@ -145,6 +145,7 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
     fi == filter_levels.len() && ti == topic_levels.len()
 }
 
+/// Erstellt einen neuen leeren [`TopicRouter`] (Convenience-Funktion).
 pub fn create_router() -> TopicRouter {
     TopicRouter::new()
 }

@@ -1,3 +1,8 @@
+//! `rusty-mqtt` — MQTT 3.1.1 Broker MVP (QoS 0).
+//!
+//! Enthaelt den [`MqttServer`]-Accept-Loop, den Connection Task mit Keep-Alive-
+//! und Fanout-Logik, sowie Hilfsmodule fuer Codec-Vorstufen, Topic-Routing und
+//! Client-Registry.
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -9,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
+use tracing::{debug, error, info, warn};
 
 use crate::client_registry::{ClientRegistry, ConnectionCommand};
 
@@ -112,17 +118,30 @@ const SUBSCRIBER_CHANNEL_CAPACITY: usize = 32;
 /// Wird hochgesetzt, sobald QoS 1/2 implementiert ist.
 const MAX_SUPPORTED_QOS: u8 = 0;
 
+/// Klassifikation eines eingehenden MQTT Control Packets (wire-level Typ).
+///
+/// Wird von `parse_packet` aus dem Fixed-Header-Byte extrahiert und
+/// im Connection-Task-Match verwendet. Ersetzt spaeter durch den vollstaendigen
+/// `MqttPacket`-Codec.
 #[derive(Debug, PartialEq)]
 pub enum MqttPacket {
+    /// CONNECT (Typ 1).
     Connect,
+    /// SUBSCRIBE (Typ 8) mit Packet Identifier.
     Subscribe(u16),
+    /// UNSUBSCRIBE (Typ 10) mit Packet Identifier.
     Unsubscribe(u16),
+    /// PUBLISH (Typ 3) mit Topic (noch nicht vollstaendig geparst).
     Publish(String),
+    /// DISCONNECT (Typ 14).
     Disconnect,
+    /// PINGREQ (Typ 12).
     PINGREQ,
+    /// Unbekannter oder nicht unterstuetzter Pakettyp.
     Unknown,
 }
 
+/// MQTT-Broker-Server; haelt Listener-Adresse, TopicRouter und ClientRegistry.
 pub struct MqttServer {
     #[allow(unused)]
     address: String,
@@ -131,6 +150,7 @@ pub struct MqttServer {
 }
 
 impl MqttServer {
+    /// Erstellt einen neuen `MqttServer` der auf `addr` (z.B. `"127.0.0.1:1883"`) lauschen wird.
     pub fn new(addr: &str) -> Self {
         Self {
             address: addr.to_string(),
@@ -148,16 +168,19 @@ impl MqttServer {
         }
     }
 
+    /// Bindet den TCP-Listener und startet die Accept-Loop.
+    ///
+    /// Laeuft bis zum Prozess-Ende (kein Graceful Shutdown im MVP).
     pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let listener = TcpListener::bind(&self.address).await?;
         let actual_addr = listener.local_addr()?;
-        println!("MQTT Broker horcht auf: {}", actual_addr);
+        info!(address = %actual_addr, "MQTT Broker horcht auf");
 
         loop {
             let (socket, _) = match listener.accept().await {
                 Ok(result) => result,
                 Err(e) => {
-                    eprintln!("Akzeptieren fehlgeschlagen: {}", e);
+                    error!(error = %e, "Akzeptieren fehlgeschlagen");
                     continue;
                 }
             };
@@ -166,7 +189,7 @@ impl MqttServer {
             let registry = Arc::clone(&self.client_registry);
             tokio::spawn(async move {
                 if let Err(e) = MqttServer::handle_connection(socket, router, registry).await {
-                    eprintln!("Fehler in Client-Verbindung: {}", e);
+                    error!(error = %e, "Fehler in Client-Verbindung");
                 }
             });
         }
@@ -197,17 +220,17 @@ impl MqttServer {
             tokio::select! {
                 _ = tokio::time::sleep_until(ka_instant), if keep_alive_deadline.is_some() => {
                     // Keep-Alive abgelaufen — Verbindung schliessen.
-                    println!("Client Keep-Alive Timeout");
+                    debug!(client_id = ?client_id, "Keep-Alive Timeout");
                     break;
                 }
                 read_result = timeout(timeout_duration, reader.read(&mut buffer)) => {
                     let bytes_read = match read_result {
                         Ok(Ok(n)) => n,
                         Ok(Err(e)) => return Err(format!("Read error: {}", e).into()),
-                        Err(_) => { println!("Client Timeout"); break; }
+                        Err(_) => { debug!(client_id = ?client_id, "Client Timeout"); break; }
                     };
                     if bytes_read == 0 {
-                        println!("Client disconnected");
+                        debug!(client_id = ?client_id, "Client disconnected");
                         break;
                     }
                     // Jedes eingehende Frame setzt den Keep-Alive-Timer zurueck.
@@ -235,7 +258,7 @@ impl MqttServer {
                                     client_id: parsed_client_id,
                                     keep_alive_secs,
                                 } => {
-                                    println!("Connection from client: {:?}", parsed_client_id);
+                                    info!(client_id = %parsed_client_id, "Client connected");
 
                                     // Keep-Alive konfigurieren: Deadline = 1.5 × keep_alive.
                                     if keep_alive_secs > 0 {
@@ -285,7 +308,7 @@ impl MqttServer {
                             let cid = client_id.as_deref().unwrap_or("unknown").to_string();
                             let suback = MqttServer::handle_subscribe_impl(frame, &cid, &router, &tx)?;
                             writer.write_all(&suback).await?;
-                            println!("SUBACK sent for client: {}", cid);
+                            debug!(client_id = %cid, "SUBACK sent");
                         }
                         MqttPacket::Unsubscribe(packet_id) => {
                             let cid = client_id.as_deref().unwrap_or("unknown");
@@ -307,12 +330,13 @@ impl MqttServer {
                             writer.write_all(&pingresp).await?;
                         }
                         MqttPacket::Disconnect => {
-                            println!("Client sent DISCONNECT");
+                            debug!(client_id = ?client_id, "Client sent DISCONNECT");
                             should_break = true;
                             break;
                         }
                         MqttPacket::Publish(_topic) => {
                             if let Some((topic, payload)) = parse_publish(frame) {
+                                debug!(client_id = ?client_id, topic = %topic, bytes = payload.len(), "PUBLISH routed");
                                 let outbound = encode_publish(&topic, &payload);
                                 let bytes = Bytes::from(outbound);
                                 // Snapshot der zustaendigen Sender, dann Lock freigeben.
@@ -327,6 +351,8 @@ impl MqttServer {
                                 for s in senders {
                                     let _ = s.try_send(ConnectionCommand::DeliverFrame(bytes.clone())); // drop-on-full
                                 }
+                            } else {
+                                warn!(client_id = ?client_id, "PUBLISH verworfen (Wildcard-Topic oder QoS > 0)");
                             }
                         }
                         _ => {}
@@ -447,6 +473,7 @@ impl MqttServer {
             .to_string()
     }
 
+    /// Extrahiert den Pakettyp aus dem Fixed-Header-Byte eines MQTT-Frames.
     pub fn parse_packet(buffer: &[u8]) -> MqttPacket {
         if buffer.is_empty() {
             return MqttPacket::Unknown;
@@ -479,6 +506,7 @@ impl MqttServer {
         }
     }
 
+    /// Liest eine 2-Byte-Packet-ID aus `buffer` ab `offset`.
     pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
         if buffer.len() > offset + 1 {
             let byte1 = buffer[offset] & 0x0F;
@@ -494,6 +522,9 @@ impl MqttServer {
     }
 }
 
+/// Liest eine 2-Byte-Packet-ID aus `buffer` ab `offset`.
+///
+/// Delegiert an [`MqttServer::extract_packet_id`].
 pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
     MqttServer::extract_packet_id(buffer, offset)
 }
