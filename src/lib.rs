@@ -3,8 +3,10 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 pub mod subscribe_handlers;
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
 pub use subscribe_handlers::{SubscribeHandler, TopicRouter};
@@ -100,6 +102,9 @@ impl BrokerConfig {
     }
 }
 
+/// Capacity des per-Connection mpsc-Channels fuer auszuliefernde Frames.
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 32;
+
 #[derive(Debug, PartialEq)]
 pub enum MqttPacket {
     Connect,
@@ -157,68 +162,95 @@ impl MqttServer {
     }
 
     async fn handle_connection(
-        mut socket: TcpStream,
+        socket: TcpStream,
         router: Arc<Mutex<TopicRouter>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut reader, mut writer) = socket.into_split();
         let mut buffer = [0u8; 1024];
         let timeout_duration = Duration::from_secs(300);
         let mut client_id: Option<String> = None;
+        let (tx, mut rx) = mpsc::channel::<Bytes>(SUBSCRIBER_CHANNEL_CAPACITY);
 
         loop {
-            let bytes_read = match timeout(timeout_duration, socket.read(&mut buffer)).await {
-                Ok(result) => result.map_err(|e| format!("Read error: {}", e))?,
-                Err(_) => {
-                    println!("Client Timeout");
-                    break;
+            tokio::select! {
+                read_result = timeout(timeout_duration, reader.read(&mut buffer)) => {
+                    let bytes_read = match read_result {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => return Err(format!("Read error: {}", e).into()),
+                        Err(_) => { println!("Client Timeout"); break; }
+                    };
+                    if bytes_read == 0 {
+                        println!("Client disconnected");
+                        break;
+                    }
+                    let mut data = &buffer[..bytes_read];
+                    let mut should_break = false;
+                    while let Some(len) = frame_length(data) {
+                        if len > data.len() {
+                            // partial frame at buffer tail — MVP-Annahme: read() liefert
+                            // ganze Frames. Wird mit Framed in spaeterer Phase robuster.
+                            break;
+                        }
+                        let frame = &data[..len];
+                        data = &data[len..];
+                        let packet_type = MqttServer::parse_packet(frame);
+                        match packet_type {
+                        MqttPacket::Connect => {
+                            let parsed_client_id = MqttServer::parse_connect_client_id(frame);
+                            println!("Connection from client: {:?}", parsed_client_id);
+                            client_id = Some(parsed_client_id);
+                            let connack = [0x20, 0x02, 0x00, 0x00];
+                            writer.write_all(&connack).await?;
+                        }
+                        MqttPacket::Subscribe(_packet_id) => {
+                            let cid = client_id.as_deref().unwrap_or("unknown").to_string();
+                            let suback = MqttServer::handle_subscribe_impl(frame, &cid, &router, &tx)?;
+                            writer.write_all(&suback).await?;
+                            println!("SUBACK sent for client: {}", cid);
+                        }
+                        MqttPacket::PINGREQ => {
+                            let pingresp = [0xD0, 0x00];
+                            writer.write_all(&pingresp).await?;
+                        }
+                        MqttPacket::Disconnect => {
+                            println!("Client sent DISCONNECT");
+                            should_break = true;
+                            break;
+                        }
+                        MqttPacket::Publish(_topic) => {
+                            if let Some((topic, payload)) = parse_publish(frame) {
+                                let outbound = encode_publish(&topic, &payload);
+                                let bytes = Bytes::from(outbound);
+                                // Snapshot der zustaendigen Sender, dann Lock freigeben.
+                                let senders: Vec<mpsc::Sender<Bytes>> = match router.lock() {
+                                    Ok(r) => r
+                                        .get_subscribers_for_topic(&topic)
+                                        .into_iter()
+                                        .map(|s| s.tx.clone())
+                                        .collect(),
+                                    Err(_) => Vec::new(),
+                                };
+                                for s in senders {
+                                    let _ = s.try_send(bytes.clone()); // drop-on-full
+                                }
+                            }
+                        }
+                        _ => {}
+                        }
+                    }
+                    if should_break { break; }
                 }
-            };
-
-            if bytes_read == 0 {
-                println!("Client disconnected");
-                break;
-            }
-
-            let packet_type = MqttServer::parse_packet(&buffer[..bytes_read]);
-
-            match packet_type {
-                MqttPacket::Connect => {
-                    let parsed_client_id = MqttServer::parse_connect_client_id(&buffer[..bytes_read]);
-                    println!("Connection from client: {:?}", parsed_client_id);
-                    client_id = Some(parsed_client_id);
-
-                    let connack = [0x20, 0x02, 0x00, 0x00];
-                    socket.write_all(&connack).await?;
+                Some(frame) = rx.recv() => {
+                    writer.write_all(&frame).await?;
                 }
-                MqttPacket::Subscribe(_packet_id) => {
-                    let cid = client_id.as_deref().unwrap_or("unknown");
-                    let suback = MqttServer::handle_subscribe_impl(
-                        &buffer[..bytes_read],
-                        cid,
-                        &router,
-                    )?;
-                    socket.write_all(&suback).await?;
-                    println!("SUBACK sent for client: {}", cid);
-                }
-                MqttPacket::PINGREQ => {
-                    let pingresp = [0xD0, 0x00];
-                    socket.write_all(&pingresp).await?;
-                }
-                MqttPacket::Disconnect => {
-                    println!("Client sent DISCONNECT");
-                    break;
-                }
-                MqttPacket::Publish(_topic) => {
-                    // TODO: Publish handling with topic routing via TopicRouter
-                }
-                _ => {}
             }
         }
 
         // Client-Subscriptions aufraeumen bei Disconnect/Timeout
-        if let Some(ref cid) = client_id {
-            if let Ok(mut r) = router.lock() {
-                r.remove_client(cid);
-            }
+        if let Some(ref cid) = client_id
+            && let Ok(mut r) = router.lock()
+        {
+            r.remove_client(cid);
         }
 
         Ok(())
@@ -230,6 +262,7 @@ impl MqttServer {
         buffer: &[u8],
         client_id: &str,
         router: &Arc<Mutex<TopicRouter>>,
+        tx: &mpsc::Sender<Bytes>,
     ) -> Result<Vec<u8>, String> {
         if buffer.len() < 4 {
             return Err("Buffer too short for SUBSCRIBE".to_string());
@@ -265,7 +298,7 @@ impl MqttServer {
         let granted_qos = router
             .lock()
             .map_err(|e| format!("Router lock failed: {}", e))?
-            .subscribe(client_id, &topic_filters);
+            .subscribe(client_id, &topic_filters, tx);
 
         Ok(SubscribeHandler::generate_suback(packet_id, &granted_qos))
     }
@@ -347,4 +380,106 @@ impl MqttServer {
 
 pub fn extract_packet_id(buffer: &[u8], offset: usize) -> Result<u16, String> {
     MqttServer::extract_packet_id(buffer, offset)
+}
+
+/// Bestimmt die Gesamtlaenge eines Frames (Fixed Header + Varint + Remaining Length).
+/// Liefert `None` wenn `buffer` zu kurz ist, um die Varint vollstaendig zu lesen.
+fn frame_length(buffer: &[u8]) -> Option<usize> {
+    if buffer.is_empty() {
+        return None;
+    }
+    let mut offset = 1usize;
+    let mut multiplier: usize = 1;
+    let mut remaining: usize = 0;
+    for _ in 0..4 {
+        if offset >= buffer.len() {
+            return None;
+        }
+        let b = buffer[offset];
+        offset += 1;
+        remaining += (b & 0x7F) as usize * multiplier;
+        if b & 0x80 == 0 {
+            return Some(offset + remaining);
+        }
+        multiplier *= 128;
+    }
+    None
+}
+
+/// Parst ein eingehendes QoS-0-PUBLISH-Frame und liefert `(topic, payload)`.
+/// Gibt `None` zurueck wenn das Frame nicht parsierbar ist (zu kurz, ungueltige
+/// Topic-Laenge etc.). Multi-Byte-Varint wird bis 4 Bytes unterstuetzt.
+fn parse_publish(buffer: &[u8]) -> Option<(String, Bytes)> {
+    if buffer.is_empty() || (buffer[0] & 0xF0) != 0x30 {
+        return None;
+    }
+    // QoS aus Fixed Header
+    let qos = (buffer[0] >> 1) & 0x03;
+    if qos != 0 {
+        // MAX_SUPPORTED_QOS = 0 — alles andere wird im MVP verworfen.
+        return None;
+    }
+
+    // Varint Remaining Length
+    let mut offset = 1usize;
+    let mut multiplier: usize = 1;
+    let mut remaining: usize = 0;
+    for _ in 0..4 {
+        if offset >= buffer.len() {
+            return None;
+        }
+        let b = buffer[offset];
+        offset += 1;
+        remaining += (b & 0x7F) as usize * multiplier;
+        if b & 0x80 == 0 {
+            break;
+        }
+        multiplier *= 128;
+    }
+
+    let body_end = offset + remaining;
+    if body_end > buffer.len() {
+        return None;
+    }
+    if offset + 2 > body_end {
+        return None;
+    }
+    let topic_len = ((buffer[offset] as usize) << 8) | (buffer[offset + 1] as usize);
+    offset += 2;
+    if offset + topic_len > body_end {
+        return None;
+    }
+    let topic = std::str::from_utf8(&buffer[offset..offset + topic_len]).ok()?;
+    offset += topic_len;
+
+    let payload = Bytes::copy_from_slice(&buffer[offset..body_end]);
+    Some((topic.to_string(), payload))
+}
+
+/// Serialisiert ein ausgehendes QoS-0-PUBLISH-Frame ohne DUP/RETAIN-Flags.
+fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
+    let topic_bytes = topic.as_bytes();
+    let remaining_len = 2 + topic_bytes.len() + payload.len();
+    let mut out = Vec::with_capacity(2 + remaining_len);
+    out.push(0x30);
+    encode_remaining_length(remaining_len, &mut out);
+    out.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(topic_bytes);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Schreibt eine MQTT Variable Byte Integer (Remaining Length) ans Ende von `out`.
+fn encode_remaining_length(mut value: usize, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
 }

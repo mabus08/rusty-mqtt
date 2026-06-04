@@ -1,10 +1,20 @@
 use std::collections::HashMap;
 
+use bytes::Bytes;
+use tokio::sync::mpsc;
+
 /// Ein einzelner Subscriber fuer ein Topic.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Haelt zusaetzlich einen `mpsc::Sender`, ueber den vom Router gefannt
+/// PUBLISH-Frames an den zustaendigen Connection Task gepusht werden.
+#[derive(Debug, Clone)]
 pub struct Subscriber {
+    /// Client-ID des Subscribers.
     pub client_id: String,
+    /// Vom Broker gewaehrter QoS-Wert (`granted_qos`).
     pub qos: u8,
+    /// Channel-Sender zum Connection Task; vorgerenderte Frames gehen hier rein.
+    pub tx: mpsc::Sender<Bytes>,
 }
 
 /// Globaler Topic Router: speichert Subscriptions nach Topic Filter.
@@ -29,7 +39,12 @@ impl TopicRouter {
     /// Registriert Subscriptions fuer einen Client.
     /// Bei Duplikaten (gleiche client_id + gleicher Topic Filter) wird der QoS aktualisiert (Replace-Semantik).
     /// Gibt die granted QoS-Werte zurueck (in der Reihenfolge der uebergebenen Filter).
-    pub fn subscribe(&mut self, client_id: &str, filters: &[(String, u8)]) -> Vec<u8> {
+    pub fn subscribe(
+        &mut self,
+        client_id: &str,
+        filters: &[(String, u8)],
+        tx: &mpsc::Sender<Bytes>,
+    ) -> Vec<u8> {
         let mut granted_qos = Vec::with_capacity(filters.len());
 
         for (topic_filter, qos) in filters {
@@ -38,10 +53,12 @@ impl TopicRouter {
             // Replace-Semantik: existierenden Eintrag fuer gleiche client_id aktualisieren
             if let Some(existing) = subscribers.iter_mut().find(|s| s.client_id == client_id) {
                 existing.qos = *qos;
+                existing.tx = tx.clone();
             } else {
                 subscribers.push(Subscriber {
                     client_id: client_id.to_string(),
                     qos: *qos,
+                    tx: tx.clone(),
                 });
             }
 
@@ -124,6 +141,11 @@ pub fn create_router() -> TopicRouter {
 mod tests {
     use super::*;
 
+    fn dummy_tx() -> mpsc::Sender<Bytes> {
+        let (tx, _rx) = mpsc::channel(1);
+        tx
+    }
+
     // --- topic_matches tests ---
 
     #[test]
@@ -175,7 +197,7 @@ mod tests {
     #[test]
     fn test_subscribe_and_lookup() {
         let mut router = TopicRouter::new();
-        let granted = router.subscribe("client-1", &[("home/temp".to_string(), 0)]);
+        let granted = router.subscribe("client-1", &[("home/temp".to_string(), 0)], &dummy_tx());
         assert_eq!(granted, vec![0]);
 
         let subs = router.get_subscribers_for_topic("home/temp");
@@ -187,8 +209,8 @@ mod tests {
     #[test]
     fn test_subscribe_replace_semantics() {
         let mut router = TopicRouter::new();
-        router.subscribe("client-1", &[("home/temp".to_string(), 0)]);
-        router.subscribe("client-1", &[("home/temp".to_string(), 1)]);
+        router.subscribe("client-1", &[("home/temp".to_string(), 0)], &dummy_tx());
+        router.subscribe("client-1", &[("home/temp".to_string(), 1)], &dummy_tx());
 
         let subs = router.get_subscribers_for_topic("home/temp");
         assert_eq!(subs.len(), 1, "Should replace, not duplicate");
@@ -198,8 +220,8 @@ mod tests {
     #[test]
     fn test_multiple_clients_same_topic() {
         let mut router = TopicRouter::new();
-        router.subscribe("client-1", &[("home/temp".to_string(), 0)]);
-        router.subscribe("client-2", &[("home/temp".to_string(), 1)]);
+        router.subscribe("client-1", &[("home/temp".to_string(), 0)], &dummy_tx());
+        router.subscribe("client-2", &[("home/temp".to_string(), 1)], &dummy_tx());
 
         let subs = router.get_subscribers_for_topic("home/temp");
         assert_eq!(subs.len(), 2);
@@ -208,7 +230,7 @@ mod tests {
     #[test]
     fn test_wildcard_subscription_lookup() {
         let mut router = TopicRouter::new();
-        router.subscribe("client-1", &[("home/+/temp".to_string(), 0)]);
+        router.subscribe("client-1", &[("home/+/temp".to_string(), 0)], &dummy_tx());
 
         let subs = router.get_subscribers_for_topic("home/kitchen/temp");
         assert_eq!(subs.len(), 1);
@@ -220,8 +242,8 @@ mod tests {
     #[test]
     fn test_remove_client() {
         let mut router = TopicRouter::new();
-        router.subscribe("client-1", &[("home/temp".to_string(), 0)]);
-        router.subscribe("client-2", &[("home/temp".to_string(), 1)]);
+        router.subscribe("client-1", &[("home/temp".to_string(), 0)], &dummy_tx());
+        router.subscribe("client-2", &[("home/temp".to_string(), 1)], &dummy_tx());
 
         router.remove_client("client-1");
 

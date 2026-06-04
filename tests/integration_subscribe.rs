@@ -57,13 +57,13 @@ mod subscribe_integration {
         packet.push(0x00); // Remaining length placeholder (will fix)
         // Variable Header
         packet.extend_from_slice(&[0x00, 0x04]); // Protocol Name Length
-        packet.extend_from_slice(b"MQTT");        // Protocol Name
-        packet.push(0x04);                        // Protocol Level (3.1.1)
-        packet.push(0x02);                        // Connect Flags (Clean Session)
-        packet.extend_from_slice(&[0x00, 0x3C]);  // Keep Alive (60s)
+        packet.extend_from_slice(b"MQTT"); // Protocol Name
+        packet.push(0x04); // Protocol Level (3.1.1)
+        packet.push(0x02); // Connect Flags (Clean Session)
+        packet.extend_from_slice(&[0x00, 0x3C]); // Keep Alive (60s)
         // Payload: Client ID
-        packet.push(0x00);                        // Client ID Length MSB
-        packet.push(client_id.len() as u8);       // Client ID Length LSB
+        packet.push(0x00); // Client ID Length MSB
+        packet.push(client_id.len() as u8); // Client ID Length LSB
         packet.extend_from_slice(client_id);
 
         // Fix remaining length
